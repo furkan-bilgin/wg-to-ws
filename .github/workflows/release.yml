@@ -15,22 +15,22 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.label }}
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - label: Linux x64
             bun-target: bun-linux-x64
-            suffix: linux-x64
+            asset: wg-to-ws-linux-x64
 
           - label: macOS arm64
             bun-target: bun-darwin-arm64
-            suffix: darwin-arm64
+            asset: wg-to-ws-darwin-arm64
 
           - label: Windows x64
             bun-target: bun-windows-x64
-            suffix: windows-x64.exe
+            asset: wg-to-ws-windows-x64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -39,17 +39,12 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=wg-to-ws-${{ matrix.suffix }} src/index.ts
-      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=wg-to-ws-server-${{ matrix.suffix }} src/server.ts
-      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=wg-to-ws-client-${{ matrix.suffix }} src/client.ts
+      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=${{ matrix.asset }} src/index.ts
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wg-to-ws-${{ matrix.suffix }}
-          path: |
-            wg-to-ws-${{ matrix.suffix }}
-            wg-to-ws-server-${{ matrix.suffix }}
-            wg-to-ws-client-${{ matrix.suffix }}
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
 
   release:
     name: Create Release
@@ -69,34 +64,26 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: wg-to-ws ${{ github.event.inputs.tag || github.ref_name }}
           body: |
-            ## wg-to-ws ${{ github.ref_name }}
+            ## wg-to-ws ${{ github.event.inputs.tag || github.ref_name }}
 
             Download the binary for your platform below.
 
             | File | Platform |
             |------|----------|
-            | `wg-to-ws-linux-x64` | Linux x86-64 (combined — `./wg-to-ws server\|client`) |
-            | `wg-to-ws-server-linux-x64` | Linux x86-64 (server only) |
-            | `wg-to-ws-client-linux-x64` | Linux x86-64 (client only) |
-            | `wg-to-ws-darwin-arm64` | macOS Apple Silicon (combined) |
-            | `wg-to-ws-server-darwin-arm64` | macOS Apple Silicon (server only) |
-            | `wg-to-ws-client-darwin-arm64` | macOS Apple Silicon (client only) |
-            | `wg-to-ws-windows-x64.exe` | Windows x86-64 (combined) |
-            | `wg-to-ws-server-windows-x64.exe` | Windows x86-64 (server only) |
-            | `wg-to-ws-client-windows-x64.exe` | Windows x86-64 (client only) |
+            | `wg-to-ws-linux-x64` | Linux x86-64 |
+            | `wg-to-ws-darwin-arm64` | macOS Apple Silicon |
+            | `wg-to-ws-windows-x64.exe` | Windows x86-64 |
 
             ### Usage
 
             ```bash
-            # Run via combined binary:
-            ./wg-to-ws-linux-x64 server
-            ./wg-to-ws-linux-x64 client
+            # Run as server
+            ./wg-to-ws-linux-x64 server --bind 0.0.0.0:443 --base-path /wg
 
-            # Or use the standalone variants:
-            WG_MODE=server ./wg-to-ws-server-linux-x64
-            WG_MODE=client ./wg-to-ws-client-linux-x64
+            # Run as client
+            ./wg-to-ws-linux-x64 client --listen 127.0.0.1:51820 --ws-url wss://vps.example.com/wg
             ```
 
-            See the README for full configuration via environment variables.
+            See the README for all CLI options and environment variables.
           files: artifacts/*
           generate_release_notes: false

@@ -1,22 +1,8 @@
-# Built binaries — macOS (native arm64)
+# Built binaries
 wg-to-ws
-wg-to-ws-server
-wg-to-ws-client
-
-# Built binaries — macOS (explicit target)
 wg-to-ws-darwin-arm64
-wg-to-ws-server-darwin-arm64
-wg-to-ws-client-darwin-arm64
-
-# Built binaries — Linux x64
 wg-to-ws-linux-x64
-wg-to-ws-server-linux-x64
-wg-to-ws-client-linux-x64
-
-# Built binaries — Windows x64
 wg-to-ws-windows-x64.exe
-wg-to-ws-server-windows-x64.exe
-wg-to-ws-client-windows-x64.exe
 
 # Bun
 node_modules/

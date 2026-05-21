@@ -1,8 +1,8 @@
 import type { ServerWebSocket } from "bun";
-import { loadConfig, normalizePath, type Config } from "./shared";
+import { loadConfig, type Config } from "./shared";
 
 const config: Config = loadConfig();
-const basePath = normalizePath(config.wsBasePath);
+const basePath = config.wsBasePath;
 
 // Map from ServerWebSocket to its dedicated UDP connected-socket
 const sessions = new Map<

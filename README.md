@@ -9,7 +9,7 @@ through firewalls, corporate proxies, and NATs that block UDP or deep-inspect
 WireGuard's protocol.
 
 **Zero dependencies** — built entirely on Bun's built-in UDP and WebSocket APIs.
-~250 lines of TypeScript.
+~260 lines of TypeScript.
 
 ## How it works
 
@@ -31,15 +31,18 @@ WireGuard's protocol.
 
 ## Usage
 
+A single binary serves both modes — just pass `server` or `client`:
+
+```bash
+./wg-to-ws server [options]
+./wg-to-ws client [options]
+```
+
 ### Server (VPS)
 
 ```bash
 # WireGuard server is already running on, say, 10.0.0.1:51820
-WG_MODE=server \
-  WS_BIND="0.0.0.0:443" \
-  WS_BASE_PATH="/wg" \
-  WG_SERVER_ADDR="10.0.0.1:51820" \
-  bun src/server.ts
+./wg-to-ws server --bind 0.0.0.0:443 --base-path /wg --wg-addr 10.0.0.1:51820
 ```
 
 ### Client (laptop)
@@ -57,34 +60,32 @@ AllowedIPs = ...
 Then start the tunnel:
 
 ```bash
-WG_MODE=client \
-  WG_LOCAL_PORT=51820 \
-  WS_URL="wss://vps.example.com/wg" \
-  bun src/client.ts
+./wg-to-ws client --listen 127.0.0.1:51820 --ws-url wss://vps.example.com/wg
 ```
 
 WireGuard now connects through the WebSocket tunnel. No changes to WireGuard's
 own config beyond the endpoint address.
 
-## Environment variables
+### Options
 
-| Variable         | Default                  | Description                               |
-|------------------|--------------------------|-------------------------------------------|
-| `WG_MODE`        | `client`                 | `client` or `server`                      |
-| `WG_LOCAL_ADDR`  | `127.0.0.1`              | UDP bind address for the client listener  |
-| `WG_LOCAL_PORT`  | `51820`                  | UDP port for the client listener          |
-| `WG_SERVER_ADDR` | `127.0.0.1:51820`        | Target WireGuard server (server mode)     |
-| `WS_URL`         | `ws://localhost:8080/wg` | WebSocket server URL (client mode)        |
-| `WS_BIND`        | `0.0.0.0:8080`           | WebSocket listen address (server mode)    |
-| `WS_BASE_PATH`   | `/wg`                    | Base path for WebSocket (server mode)     |
+| CLI flag | Short | Env var | Default | Description |
+|----------|-------|---------|---------|-------------|
+| `--bind` | `-b` | `WS_BIND` | `0.0.0.0:8080` | WebSocket listen address (server) |
+| `--base-path` | `-p` | `WS_BASE_PATH` | `/wg` | WebSocket base path (server) |
+| `--wg-addr` | `-w` | `WG_SERVER_ADDR` | `127.0.0.1:51820` | Target WireGuard server (server) |
+| `--listen` | `-l` | `WG_LOCAL_ADDR` + `WG_LOCAL_PORT` | `127.0.0.1:51820` | UDP listen address (client) |
+| `--local-addr` | `-a` | `WG_LOCAL_ADDR` | `127.0.0.1` | UDP bind address (client) |
+| `--local-port` | `-P` | `WG_LOCAL_PORT` | `51820` | UDP port (client) |
+| `--ws-url` | `-u` | `WS_URL` | `ws://localhost:8080/wg` | WebSocket server URL (client) |
+| `--mode` | | `WG_MODE` | `client` | `server` or `client` |
+
+All flags can also be set via environment variables. CLI flags take precedence.
 
 ## Running with TLS (production)
 
-Bun's `WebSocket` client supports `wss://` natively. For the server, you have
-two options:
+Use `wss://` in `--ws-url` — Bun's WebSocket client handles TLS natively.
 
-**Option A — reverse proxy (recommended):** Put Caddy, nginx, or Traefik in
-front of wg-to-ws. They handle TLS termination and let wg-to-ws stay simple.
+For the server, put Caddy, nginx, or Traefik in front of wg-to-ws:
 
 ```nginx
 # nginx example
@@ -96,9 +97,6 @@ location /wg {
 }
 ```
 
-**Option B — Bun TLS:** Pass TLS options to `Bun.serve` (requires a certificate
-file — not yet wired in this project; easy to add).
-
 ## Integration test
 
 ```bash
@@ -106,17 +104,28 @@ bash test/integration.sh
 ```
 
 Starts a UDP echo server, the wg-to-ws server, the wg-to-ws client, sends a
-known payload over UDP, and finally confirms the echo comes back through the tunnel.
+known payload over UDP, and confirms the echo comes back through the tunnel.
 
 ## Project structure
 
 ```
 src/
-  shared.ts   — Config types, env-var parsing, path normalisation
+  index.ts    — Entry point: parses CLI args, dispatches to server or client
+  shared.ts   — Config types, env-var parsing, CLI arg parsing, path normalisation
   server.ts   — WebSocket server with base-path routing, UDP forwarding
   client.ts   — UDP listener, WebSocket forwarding, reconnection
 test/
   integration.sh — End-to-end smoke test
+```
+
+## Build
+
+```bash
+bun run build                   # native (macOS arm64)
+bun run build:linux             # cross-compile: Linux x86-64
+bun run build:darwin-arm64      # cross-compile: macOS arm64
+bun run build:windows-x64       # cross-compile: Windows x86-64
+make all-platforms              # all three at once
 ```
 
 ## Caveats
