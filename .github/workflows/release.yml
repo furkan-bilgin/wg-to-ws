@@ -66,7 +66,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          name: wg-to-ws ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: wg-to-ws ${{ github.event.inputs.tag || github.ref_name }}
           body: |
             ## wg-to-ws ${{ github.ref_name }}
 
