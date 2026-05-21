@@ -106,7 +106,7 @@ bash test/integration.sh
 ```
 
 Starts a UDP echo server, the wg-to-ws server, the wg-to-ws client, sends a
-known payload over UDP, and confirms the echo comes back through the tunnel.
+known payload over UDP, and finally confirms the echo comes back through the tunnel.
 
 ## Project structure
 
