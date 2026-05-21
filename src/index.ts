@@ -9,28 +9,31 @@
  * Options override the equivalent environment variables.
  *
  * Server:
- *   --bind <addr>          WS_BIND           (default 0.0.0.0:8080)
- *   --base-path <path>     WS_BASE_PATH      (default /wg)
- *   --wg-addr <addr>       WG_SERVER_ADDR    (default 127.0.0.1:51820)
+ *   --bind <addr>            WS_BIND           (default 0.0.0.0:8080)
+ *   --base-path <path>       WS_BASE_PATH      (default /wg)
+ *   --wg-addr <addr>         WG_SERVER_ADDR    (default 127.0.0.1:51820)
  *
  * Client:
- *   --listen <addr:port>   WG_LOCAL_ADDR + WG_LOCAL_PORT  (127.0.0.1:51820)
- *   --local-addr <addr>    WG_LOCAL_ADDR     (default 127.0.0.1)
- *   --local-port <port>    WG_LOCAL_PORT     (default 51820)
- *   --ws-url <url>         WS_URL            (default ws://localhost:8080/wg)
+ *   --listen <addr:port>     WG_LOCAL_ADDR + WG_LOCAL_PORT  (127.0.0.1:51820)
+ *   --local-addr <addr>      WG_LOCAL_ADDR     (default 127.0.0.1)
+ *   --local-port <port>      WG_LOCAL_PORT     (default 51820)
+ *   --ws-url <url>           WS_URL            (default ws://localhost:8080/wg)
  *
- * Short flags:  -b, -p, -w, -l, -u, -a, -P
+ * Both:
+ *   --shared-key <secret>    WG_SHARED_KEY     (default none)
+ *   --mode <server|client>   WG_MODE           (default client)
+ *
+ * Short flags:  -b, -p, -w, -l, -u, -a, -P, -k
  *
  * Examples:
- *   wg-to-ws server --bind 0.0.0.0:443 --base-path /wg --wg-addr 10.0.0.1:51820
- *   wg-to-ws client -l 127.0.0.1:51820 -u wss://vps.example.com/wg
+ *   wg-to-ws server -b 0.0.0.0:443 -p /wg -w 10.0.0.1:51820 -k mysecret
+ *   wg-to-ws client -l 127.0.0.1:51820 -u wss://vps.example.com/wg -k mysecret
  */
 
 import { parseCLIArgs } from "./shared";
 
 const args = process.argv.slice(2);
 
-// First positional arg that isn't a flag determines the mode
 let mode = "";
 const flagArgs: string[] = [];
 
@@ -42,7 +45,6 @@ for (const a of args) {
   }
 }
 
-// CLI flags override env vars — inject them into process.env
 const cliOverrides = parseCLIArgs(flagArgs);
 
 if (cliOverrides["WG_MODE"]) mode = cliOverrides["WG_MODE"];

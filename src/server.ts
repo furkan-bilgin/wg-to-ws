@@ -1,14 +1,25 @@
 import type { ServerWebSocket } from "bun";
-import { loadConfig, type Config } from "./shared";
+import {
+  loadConfig,
+  deriveKey,
+  encrypt,
+  decrypt,
+  parseAuthMessage,
+  AUTH_OK,
+  type Config,
+} from "./shared";
 
 const config: Config = loadConfig();
 const basePath = config.wsBasePath;
+const encKey = config.sharedKey ? deriveKey(config.sharedKey) : null;
 
-// Map from ServerWebSocket to its dedicated UDP connected-socket
-const sessions = new Map<
-  ServerWebSocket,
-  { udp: import("bun").udp.ConnectedSocket<"buffer">; addr: string }
->();
+interface Session {
+  udp: import("bun").udp.ConnectedSocket<"buffer">;
+  addr: string;
+  authed: boolean;
+}
+
+const sessions = new Map<ServerWebSocket, Session>();
 
 async function createUdpSocket(
   ws: ServerWebSocket,
@@ -22,11 +33,21 @@ async function createUdpSocket(
       connect: { hostname: host, port },
       socket: {
         data(_socket, buf) {
-          // Forward UDP response back to the WebSocket client
-          if (ws.readyState === 1) {
-            // OPEN
-            ws.sendBinary(buf as Buffer);
+          const session = sessions.get(ws);
+          if (!session || !session.authed) return;
+
+          let payload = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+
+          // Encrypt if shared key is configured
+          if (encKey) {
+            try {
+              payload = encrypt(payload, encKey);
+            } catch {
+              return;
+            }
           }
+
+          if (ws.readyState === 1) ws.sendBinary(payload as Buffer);
         },
         error(_socket, err) {
           console.error("UDP error:", err);
@@ -40,23 +61,20 @@ async function createUdpSocket(
   }
 }
 
+function sendAuthFail(ws: ServerWebSocket) {
+  ws.close(4001, "AUTH:FAIL");
+}
+
 const server = Bun.serve({
   port: parseInt(config.wsBind.split(":")[1] || "8080", 10),
   hostname: config.wsBind.split(":")[0] || "0.0.0.0",
   fetch(req, server) {
     const url = new URL(req.url);
-
-    // Base-path check: the pathname must start with basePath
     if (!url.pathname.startsWith(basePath)) {
       return new Response("Not found", { status: 404 });
     }
-
-    // Upgrade to WebSocket
     const success = server.upgrade(req);
-    if (success) {
-      return undefined;
-    }
-
+    if (success) return undefined;
     return new Response("Upgrade failed", { status: 400 });
   },
   websocket: {
@@ -66,17 +84,47 @@ const server = Bun.serve({
         ws.close(1011, "Failed to create UDP socket");
         return;
       }
-      sessions.set(ws, { udp, addr: config.wgServerAddr });
-      console.log(`New session — WS connected, UDP → ${config.wgServerAddr}`);
+
+      const session: Session = { udp, addr: config.wgServerAddr, authed: !encKey };
+      sessions.set(ws, session);
+
+      if (!encKey) {
+        console.log(`New session — WS connected, UDP → ${config.wgServerAddr}`);
+      }
+      // If encKey is set, we wait for auth message before logging
     },
 
     message(ws, raw) {
       const session = sessions.get(ws);
       if (!session) return;
 
-      // Forward binary data to WireGuard via UDP
-      const data = typeof raw === "string" ? Buffer.from(raw) : raw;
-      session.udp.send(data);
+      const data = typeof raw === "string" ? Buffer.from(raw) : (raw as Buffer);
+
+      // Handle auth handshake
+      if (!session.authed && encKey) {
+        const msg = typeof raw === "string" ? raw : raw.toString();
+        const key = parseAuthMessage(msg);
+        if (key === config.sharedKey) {
+          session.authed = true;
+          ws.sendText(AUTH_OK);
+          console.log(`New session — WS connected, UDP → ${config.wgServerAddr}`);
+        } else {
+          sendAuthFail(ws);
+        }
+        return;
+      }
+
+      // Decrypt if shared key is configured
+      let payload = data;
+      if (encKey) {
+        try {
+          payload = decrypt(data, encKey);
+        } catch {
+          return; // drop malformed messages
+        }
+      }
+
+      session.udp.send(payload);
     },
 
     close(ws) {
@@ -92,7 +140,6 @@ const server = Bun.serve({
 
 console.log(`Server listening on ${config.wsBind}, base path "${basePath}"`);
 
-// Graceful shutdown
 function shutdown() {
   console.log("\nShutting down...");
   for (const [ws, session] of sessions) {

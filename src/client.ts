@@ -1,13 +1,25 @@
-import { loadConfig, type Config } from "./shared";
+import {
+  loadConfig,
+  deriveKey,
+  encrypt,
+  decrypt,
+  makeAuthMessage,
+  isAuthOk,
+  type Config,
+} from "./shared";
 
 const config: Config = loadConfig();
+const encKey = config.sharedKey ? deriveKey(config.sharedKey) : null;
 
 let ws: WebSocket | null = null;
 let udpSocket: import("bun").udp.Socket<"buffer"> | null = null;
-// Track the last sender (address + port) so we can route responses back
 let peerAddr = "";
 let peerPort = 0;
 let reconnectAttempt = 0;
+let authed = false;
+
+// Buffer outgoing UDP packets until auth completes
+let pendingQueue: Array<{ buf: Buffer; port: number; addr: string }> = [];
 
 // ── WebSocket connection with exponential backoff ──────────────
 
@@ -16,6 +28,9 @@ function connectWs() {
     return;
   }
 
+  authed = false;
+  pendingQueue = [];
+
   console.log(`Connecting to ${config.wsUrl}...`);
   ws = new WebSocket(config.wsUrl);
 
@@ -23,25 +38,62 @@ function connectWs() {
 
   ws.onopen = () => {
     console.log("WebSocket connected");
-    reconnectAttempt = 0;
+
+    // Send auth if shared key is configured
+    if (encKey) {
+      ws!.send(makeAuthMessage(config.sharedKey));
+    } else {
+      authed = true;
+    }
   };
 
   ws.onmessage = (event: MessageEvent) => {
-    // Forward binary data from WebSocket back to the local WireGuard client via UDP
-    if (!udpSocket || !peerPort) return;
-
     const data = event.data;
+
+    // Handle auth response
+    if (!authed && encKey && typeof data === "string") {
+      if (isAuthOk(data)) {
+        authed = true;
+        console.log("Authenticated");
+        // Flush queued packets
+        for (const p of pendingQueue) {
+          sendEncrypted(p.buf);
+        }
+        pendingQueue = [];
+      } else {
+        console.error("Authentication failed");
+        ws?.close();
+      }
+      return;
+    }
+
+    // Decrypt incoming data
+    let payload: Buffer;
     if (typeof data === "string") {
-      udpSocket.send(Buffer.from(data), peerPort, peerAddr);
+      payload = Buffer.from(data);
     } else {
-      udpSocket.send(new Uint8Array(data as ArrayBuffer), peerPort, peerAddr);
+      payload = Buffer.from(data as ArrayBuffer);
+    }
+
+    if (encKey) {
+      try {
+        payload = decrypt(payload, encKey);
+      } catch {
+        return; // drop malformed
+      }
+    }
+
+    // Forward to local WireGuard client
+    if (udpSocket && peerPort) {
+      udpSocket.send(payload, peerPort, peerAddr);
     }
   };
 
   ws.onclose = () => {
     console.log("WebSocket disconnected — reconnecting...");
     ws = null;
-    // Exponential backoff: 100ms -> 200ms -> 400ms -> ... -> 10s cap
+    authed = false;
+    pendingQueue = [];
     const delay = Math.min(100 * Math.pow(2, reconnectAttempt), 10_000);
     reconnectAttempt++;
     setTimeout(connectWs, delay);
@@ -52,6 +104,23 @@ function connectWs() {
   };
 }
 
+// ── Encrypt and send via WebSocket ────────────────────────────
+
+function sendEncrypted(buf: Buffer) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  let payload = buf;
+  if (encKey) {
+    try {
+      payload = encrypt(payload, encKey);
+    } catch {
+      return;
+    }
+  }
+
+  ws.send(payload as unknown as ArrayBuffer);
+}
+
 // ── UDP listener ───────────────────────────────────────────────
 
 async function startUdp() {
@@ -60,13 +129,15 @@ async function startUdp() {
     port: config.localPort,
     socket: {
       data(_socket, buf, port, addr) {
-        // Remember where this packet came from so we can send responses back
         peerAddr = addr;
         peerPort = port;
 
-        // Forward to WebSocket
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(buf as unknown as ArrayBuffer);
+        const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+
+        if (!authed && encKey) {
+          pendingQueue.push({ buf: rawBuf, port, addr });
+        } else {
+          sendEncrypted(rawBuf);
         }
       },
       error(_socket, err) {
@@ -84,7 +155,6 @@ async function main() {
   await startUdp();
   connectWs();
 
-  // Graceful shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
     ws?.close();
