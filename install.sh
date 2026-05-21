@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 # wg-to-ws — one-line install
 #   curl -fsSL https://raw.githubusercontent.com/furkan-bilgin/wg-to-ws/main/install.sh | sh
+#
+# Windows:
+#   iwr -useb https://raw.githubusercontent.com/furkan-bilgin/wg-to-ws/main/install.ps1 | iex
 set -eu
 
 REPO="furkan-bilgin/wg-to-ws"

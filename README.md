@@ -11,6 +11,20 @@ WireGuard's protocol.
 **Zero dependencies** — built entirely on Bun's built-in UDP and WebSocket APIs.
 ~260 lines of TypeScript.
 
+## Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/furkan-bilgin/wg-to-ws/main/install.sh | sh
+```
+
+```powershell
+# Windows
+iwr -useb https://raw.githubusercontent.com/furkan-bilgin/wg-to-ws/main/install.ps1 | iex
+```
+
+Or download a binary from the [latest release](https://github.com/furkan-bilgin/wg-to-ws/releases/latest).
+
 ## How it works
 
 ```
@@ -77,6 +91,7 @@ own config beyond the endpoint address.
 | `--local-addr` | `-a` | `WG_LOCAL_ADDR` | `127.0.0.1` | UDP bind address (client) |
 | `--local-port` | `-P` | `WG_LOCAL_PORT` | `51820` | UDP port (client) |
 | `--ws-url` | `-u` | `WS_URL` | `ws://localhost:8080/wg` | WebSocket server URL (client) |
+| `--shared-key` | `-k` | `WG_SHARED_KEY` | _(none)_ | Pre-shared key for auth + AES-256-GCM encryption |
 | `--mode` | | `WG_MODE` | `client` | `server` or `client` |
 
 All flags can also be set via environment variables. CLI flags take precedence.
