@@ -5,7 +5,9 @@
 
 import { parseArgs } from "util";
 
-const VERSION = "0.1.0";
+// Set via `--define VERSION=...` at build time; fallback for dev mode
+declare var WG_VERSION: string | undefined;
+const VERSION: string = WG_VERSION || "dev";
 
 interface OptionDef {
   name: string;
@@ -92,7 +94,7 @@ if (values.help) {
 }
 
 if (values.version) {
-  console.log(`wg-to-ws v${VERSION}`);
+  console.log(`wg-to-ws ${VERSION}`);
   process.exit(0);
 }
 

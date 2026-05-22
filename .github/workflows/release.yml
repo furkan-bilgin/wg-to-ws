@@ -40,7 +40,7 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=${{ matrix.asset }} src/index.ts
+      - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=${{ matrix.asset }} --define WG_VERSION=${{ github.ref_name }} src/index.ts
 
       - uses: actions/upload-artifact@v4
         with:
