@@ -39,7 +39,7 @@ export function deriveKey(secret: string): Buffer {
  */
 export function encrypt(plaintext: Buffer, key: Buffer): Buffer {
   const nonce = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([nonce, encrypted, tag]);
@@ -52,7 +52,7 @@ export function decrypt(data: Buffer, key: Buffer): Buffer {
   const nonce = data.subarray(0, 12);
   const tag = data.subarray(data.length - 16);
   const ciphertext = data.subarray(12, data.length - 16);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
