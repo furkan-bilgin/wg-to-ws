@@ -6,6 +6,7 @@ import {
   decrypt,
   parseAuthMessage,
   AUTH_OK,
+  PING_INTERVAL,
   type Config,
 } from "./shared";
 
@@ -17,6 +18,7 @@ interface Session {
   udp: import("bun").udp.ConnectedSocket<"buffer">;
   addr: string;
   authed: boolean;
+  pingTimer: ReturnType<typeof setInterval> | null;
 }
 
 const sessions = new Map<ServerWebSocket, Session>();
@@ -38,13 +40,8 @@ async function createUdpSocket(
 
           let payload = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
 
-          // Encrypt if shared key is configured
           if (encKey) {
-            try {
-              payload = encrypt(payload, encKey);
-            } catch {
-              return;
-            }
+            try { payload = encrypt(payload, encKey); } catch { return; }
           }
 
           if (ws.readyState === 1) ws.sendBinary(payload as Buffer);
@@ -61,8 +58,10 @@ async function createUdpSocket(
   }
 }
 
-function sendAuthFail(ws: ServerWebSocket) {
-  ws.close(4001, "AUTH:FAIL");
+function startPing(ws: ServerWebSocket) {
+  return setInterval(() => {
+    if (ws.readyState === 1) ws.sendText("PING");
+  }, PING_INTERVAL);
 }
 
 const server = Bun.serve({
@@ -85,13 +84,20 @@ const server = Bun.serve({
         return;
       }
 
-      const session: Session = { udp, addr: config.wgServerAddr, authed: !encKey };
+      const session: Session = {
+        udp,
+        addr: config.wgServerAddr,
+        authed: !encKey,
+        pingTimer: null,
+      };
       sessions.set(ws, session);
+
+      // Start ping keepalive
+      session.pingTimer = startPing(ws);
 
       if (!encKey) {
         console.log(`New session — WS connected, UDP → ${config.wgServerAddr}`);
       }
-      // If encKey is set, we wait for auth message before logging
     },
 
     message(ws, raw) {
@@ -99,6 +105,14 @@ const server = Bun.serve({
       if (!session) return;
 
       const data = typeof raw === "string" ? Buffer.from(raw) : (raw as Buffer);
+
+      // Handle ping from client — respond with pong
+      if (typeof raw === "string" && raw === "PING") {
+        ws.sendText("PONG");
+        return;
+      }
+      // Handle pong from client — no-op
+      if (typeof raw === "string" && raw === "PONG") return;
 
       // Handle auth handshake
       if (!session.authed && encKey) {
@@ -109,7 +123,7 @@ const server = Bun.serve({
           ws.sendText(AUTH_OK);
           console.log(`New session — WS connected, UDP → ${config.wgServerAddr}`);
         } else {
-          sendAuthFail(ws);
+          ws.close(4001, "AUTH:FAIL");
         }
         return;
       }
@@ -117,11 +131,7 @@ const server = Bun.serve({
       // Decrypt if shared key is configured
       let payload = data;
       if (encKey) {
-        try {
-          payload = decrypt(data, encKey);
-        } catch {
-          return; // drop malformed messages
-        }
+        try { payload = decrypt(data, encKey); } catch { return; }
       }
 
       session.udp.send(payload);
@@ -130,6 +140,7 @@ const server = Bun.serve({
     close(ws) {
       const session = sessions.get(ws);
       if (session) {
+        if (session.pingTimer) clearInterval(session.pingTimer);
         session.udp.close();
         sessions.delete(ws);
         console.log("Session closed");
@@ -144,6 +155,7 @@ function shutdown() {
   console.log("\nShutting down...");
   for (const [ws, session] of sessions) {
     session.udp.close();
+    if (session.pingTimer) clearInterval(session.pingTimer);
     ws.close(1001, "Server shutting down");
   }
   server.stop();

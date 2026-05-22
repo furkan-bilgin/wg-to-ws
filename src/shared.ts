@@ -13,6 +13,9 @@ export interface Config {
   sharedKey: string;
 }
 
+/** WebSocket ping interval in ms — keeps connection alive through proxies. */
+export const PING_INTERVAL = 25_000;
+
 /** Normalise a path: strip trailing slashes and collapse double slashes. */
 export function normalizePath(p: string): string {
   return "/" + p.replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
