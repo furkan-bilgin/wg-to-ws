@@ -36,21 +36,23 @@ while True:
 ECHO_PID=$!
 sleep 0.5
 
-# 2. Start wg-to-ws server
+# 2. Start wg-to-ws server with --no-auth (no shared key for test)
 echo "=== 2. Starting wg-to-ws server on port $WS_PORT ==="
 WG_MODE=server \
   WS_BIND="0.0.0.0:$WS_PORT" \
   WS_BASE_PATH="$BASE_PATH" \
   WG_SERVER_ADDR="127.0.0.1:$UDP_ECHO_PORT" \
+  WG_NO_AUTH=true \
   bun run "$PROJECT_DIR/src/server.ts" &
 SERVER_PID=$!
 sleep 1
 
-# 3. Start wg-to-ws client
+# 3. Start wg-to-ws client with --no-auth
 echo "=== 3. Starting wg-to-ws client on UDP $LOCAL_UDP_PORT ==="
 WG_MODE=client \
   WG_LOCAL_PORT="$LOCAL_UDP_PORT" \
   WS_URL="ws://localhost:$WS_PORT$BASE_PATH" \
+  WG_NO_AUTH=true \
   bun run "$PROJECT_DIR/src/client.ts" &
 CLIENT_PID=$!
 sleep 1.5

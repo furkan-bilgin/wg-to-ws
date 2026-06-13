@@ -36,10 +36,34 @@ fi
 
 BINARY="wg-to-ws-$SUFFIX"
 URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY"
+CHECKSUM_URL="https://github.com/$REPO/releases/download/$VERSION/checksums.txt"
 DEST="${DEST:-/usr/local/bin/wg-to-ws}"
 
 echo "Downloading $BINARY ($VERSION)..."
 curl -fsSL "$URL" -o /tmp/wg-to-ws
+
+# M4: Verify SHA-256 checksum
+echo "Verifying checksum..."
+CHECKSUMS=$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null || true)
+if [ -n "$CHECKSUMS" ]; then
+  EXPECTED=$(echo "$CHECKSUMS" | grep "$BINARY" | cut -d' ' -f1)
+  if [ -n "$EXPECTED" ]; then
+    ACTUAL=$(sha256sum /tmp/wg-to-ws | cut -d' ' -f1)
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+      echo "ERROR: Checksum mismatch for $BINARY"
+      echo "  Expected: $EXPECTED"
+      echo "  Actual:   $ACTUAL"
+      rm -f /tmp/wg-to-ws
+      exit 1
+    fi
+    echo "Checksum OK"
+  else
+    echo "WARNING: $BINARY not found in checksums.txt — skipping verification"
+  fi
+else
+  echo "WARNING: Could not fetch checksums.txt — skipping verification"
+fi
+
 chmod +x /tmp/wg-to-ws
 
 if [ -w "$(dirname "$DEST")" ]; then

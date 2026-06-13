@@ -1,11 +1,18 @@
 import {
   loadConfig,
   deriveKey,
+  computeAuthHmac,
   encrypt,
   decrypt,
-  makeAuthMessage,
+  encodeSeqNum,
+  decodeSeqNum,
+  parseChallengeMessage,
+  makeAuthResponseMessage,
   isAuthOk,
   PING_INTERVAL,
+  AUTH_TIMEOUT,
+  MAX_SENDERS,
+  SEQ_NUM_BYTES,
   type Config,
 } from "./shared";
 
@@ -17,22 +24,34 @@ let udpSocket: import("bun").udp.Socket<"buffer"> | null = null;
 let reconnectAttempt = 0;
 let authed = false;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
+let authTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Track UDP senders by source address:port so we can route responses back correctly,
-// even if the WireGuard client changes ports mid-session.
+// M3: Bounded sender map — LRU-style, caps at MAX_SENDERS entries.
+// Tracks UDP senders by source address:port so we can route responses back.
 const senders = new Map<string, { addr: string; port: number }>();
 
 // Buffer outgoing UDP packets until auth completes
 let pendingQueue: Array<{ buf: Buffer; port: number; addr: string }> = [];
 
+// H3: Replay protection — last received sequence number (server -> client)
+let lastSeqReceived = -1;
+// Send counter (client -> server)
+let sendCounter = 0;
+
 // ── WebSocket connection with exponential backoff ──────────────
 
 function connectWs() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+  if (
+    ws &&
+    (ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING)
+  ) {
     return;
   }
 
   authed = false;
+  lastSeqReceived = -1;
+  sendCounter = 0;
   pendingQueue = [];
   senders.clear();
 
@@ -43,34 +62,65 @@ function connectWs() {
 
   ws.onopen = () => {
     console.log("WebSocket connected");
-    startPing();
 
-    if (encKey) {
-      ws!.send(makeAuthMessage(config.sharedKey));
-    } else {
+    if (!encKey) {
+      // No auth mode
       authed = true;
+      startPing();
     }
+    // With auth: wait for challenge from server
   };
 
   ws.onmessage = (event: MessageEvent) => {
     const data = event.data;
 
-    // Handle auth response
-    if (!authed && encKey && typeof data === "string") {
+    // Handle auth handshake
+    if (!authed && encKey) {
+      if (typeof data !== "string") return;
+
+      // C1: Parse challenge from server
+      const challenge = parseChallengeMessage(data);
+      if (challenge) {
+        // Compute HMAC response
+        const hmac = computeAuthHmac(encKey, challenge);
+        ws!.send(makeAuthResponseMessage(hmac));
+
+        // Set auth timeout
+        if (authTimer) clearTimeout(authTimer);
+        authTimer = setTimeout(() => {
+          if (!authed) {
+            console.error("Auth handshake timed out");
+            ws?.close();
+          }
+        }, AUTH_TIMEOUT);
+        return;
+      }
+
+      // C1: Parse auth OK
       if (isAuthOk(data)) {
         authed = true;
+        if (authTimer) clearTimeout(authTimer);
+        authTimer = null;
         console.log("Authenticated");
-        for (const p of pendingQueue) sendEncrypted(p.buf);
+        startPing();
+
+        // Flush buffered UDP packets
+        for (const p of pendingQueue) sendUdpPayload(p.buf);
         pendingQueue = [];
-      } else {
-        console.error("Authentication failed");
-        ws?.close();
+        return;
       }
+
+      console.error("Authentication failed");
+      ws?.close();
       return;
     }
 
-    // Handle pong from server (no-op, just a keepalive)
+    // Handle pong from server (keepalive)
     if (typeof data === "string" && data === "PONG") return;
+    if (typeof data === "string" && data === "PING") {
+      ws?.send("PONG");
+      return;
+    }
 
     // Decrypt incoming data
     let payload: Buffer;
@@ -81,13 +131,25 @@ function connectWs() {
     }
 
     if (encKey) {
-      try { payload = decrypt(payload, encKey); } catch { return; }
+      // H3: Decrypt and verify sequence number
+      const decrypted = decrypt(payload, encKey);
+      if (!decrypted) return;
+
+      // Extract and verify sequence number (replay protection)
+      const seqBuf = payload.subarray(0, SEQ_NUM_BYTES);
+      const seqNum = decodeSeqNum(seqBuf);
+      if (seqNum <= lastSeqReceived) {
+        // Replay or out-of-order — drop
+        return;
+      }
+      lastSeqReceived = seqNum;
+
+      payload = decrypted;
     }
 
     // Forward to the most recent sender
     if (!udpSocket || senders.size === 0) return;
 
-    // Try the most recently seen sender first
     const entries = [...senders.entries()];
     const last = entries[entries.length - 1];
     if (last) {
@@ -99,6 +161,8 @@ function connectWs() {
   ws.onclose = () => {
     console.log("WebSocket disconnected — reconnecting...");
     stopPing();
+    if (authTimer) clearTimeout(authTimer);
+    authTimer = null;
     ws = null;
     authed = false;
     pendingQueue = [];
@@ -107,7 +171,9 @@ function connectWs() {
     setTimeout(connectWs, delay);
   };
 
-  ws.onerror = () => { ws?.close(); };
+  ws.onerror = () => {
+    ws?.close();
+  };
 }
 
 // ── WebSocket ping/pong ───────────────────────────────────────
@@ -120,15 +186,26 @@ function startPing() {
 }
 
 function stopPing() {
-  if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
 }
 
 // ── Encrypt and send via WebSocket ────────────────────────────
 
-function sendEncrypted(buf: Buffer) {
+function sendUdpPayload(buf: Buffer) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   let payload = buf;
-  if (encKey) { try { payload = encrypt(payload, encKey); } catch { return; } }
+  if (encKey) {
+    try {
+      const seqBuf = encodeSeqNum(sendCounter);
+      sendCounter++;
+      payload = encrypt(payload, encKey, seqBuf);
+    } catch {
+      return;
+    }
+  }
   ws.send(payload as unknown as ArrayBuffer);
 }
 
@@ -141,6 +218,13 @@ async function startUdp() {
     socket: {
       data(_socket, buf, port, addr) {
         const key = `${addr}:${port}`;
+
+        // M3: Bounded sender map — maintain most recent sender, cap size
+        if (!senders.has(key) && senders.size >= MAX_SENDERS) {
+          // Evict the oldest entry (first inserted)
+          const oldestKey = senders.keys().next().value;
+          if (oldestKey !== undefined) senders.delete(oldestKey);
+        }
         senders.set(key, { addr, port });
 
         const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
@@ -148,7 +232,7 @@ async function startUdp() {
         if (!authed && encKey) {
           pendingQueue.push({ buf: rawBuf, port, addr });
         } else {
-          sendEncrypted(rawBuf);
+          sendUdpPayload(rawBuf);
         }
       },
       error(_socket, err) {
@@ -169,6 +253,7 @@ async function main() {
   const shutdown = () => {
     console.log("\nShutting down...");
     stopPing();
+    if (authTimer) clearTimeout(authTimer);
     ws?.close();
     udpSocket?.close();
     process.exit(0);

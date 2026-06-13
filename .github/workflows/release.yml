@@ -38,14 +38,19 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.2.8
 
       - run: bun build --compile --target=${{ matrix.bun-target }} --outfile=${{ matrix.asset }} --define WG_VERSION=${{ github.ref_name }} src/index.ts
+
+      # M4: Generate SHA-256 checksum for this binary
+      - run: sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   release:
     name: Create Release
@@ -61,6 +66,11 @@ jobs:
 
       - name: List artifacts
         run: ls -lhR artifacts/
+
+      # Generate a combined checksums.txt from individual .sha256 files
+      - name: Generate combined checksums.txt
+        run: |
+          cat artifacts/*.sha256 2>/dev/null | sort > artifacts/checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -81,10 +91,18 @@ jobs:
 
             ```bash
             # Run as server
-            ./wg-to-ws-linux-x64 server --bind 0.0.0.0:443 --base-path /wg
+            ./wg-to-ws-linux-x64 server --bind 127.0.0.1:8080 --base-path /wg
 
             # Run as client
             ./wg-to-ws-linux-x64 client --listen 127.0.0.1:51820 --ws-url wss://vps.example.com/wg
+            ```
+
+            ### Verify integrity
+
+            Download `checksums.txt` and verify with:
+
+            ```bash
+            sha256sum -c checksums.txt --ignore-missing
             ```
 
             See the README for all CLI options and environment variables.

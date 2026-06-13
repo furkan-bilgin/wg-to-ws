@@ -1,15 +1,10 @@
 # wg-to-ws
 
-> **Disclaimer:** This project is vibecoded. It works (integration test passes),
-> but don't expect production-grade error handling, security hardening, or
-> aesthetic code. Review before deploying to production.
-
 Tunnel WireGuard UDP traffic over WebSocket connections — lets WireGuard work
 through firewalls, corporate proxies, and NATs that block UDP or deep-inspect
 WireGuard's protocol.
 
-**Zero dependencies** — built entirely on Bun's built-in UDP and WebSocket APIs.
-~260 lines of TypeScript.
+**Zero runtime dependencies** — built entirely on Bun's built-in UDP and WebSocket APIs.
 
 ## Install
 
@@ -56,7 +51,7 @@ A single binary serves both modes — just pass `server` or `client`:
 
 ```bash
 # WireGuard server is already running on, say, 10.0.0.1:51820
-./wg-to-ws server --bind 0.0.0.0:443 --base-path /wg --wg-addr 10.0.0.1:51820
+./wg-to-ws server --bind 127.0.0.1:8080 --base-path /wg --wg-addr 10.0.0.1:51820 --shared-key mysecret
 ```
 
 ### Client (laptop)
@@ -74,17 +69,17 @@ AllowedIPs = ...
 Then start the tunnel:
 
 ```bash
-./wg-to-ws client --listen 127.0.0.1:51820 --ws-url wss://vps.example.com/wg
+./wg-to-ws client --listen 127.0.0.1:51820 --ws-url wss://vps.example.com/wg --shared-key mysecret
 ```
 
-WireGuard now connects through the WebSocket tunnel. No changes to WireGuard's
+WireGuard now connects through the encrypted WebSocket tunnel. No changes to WireGuard's
 own config beyond the endpoint address.
 
-### Options
+## Options
 
 | CLI flag | Short | Env var | Default | Description |
 |----------|-------|---------|---------|-------------|
-| `--bind` | `-b` | `WS_BIND` | `0.0.0.0:8080` | WebSocket listen address (server) |
+| `--bind` | `-b` | `WS_BIND` | `127.0.0.1:8080` | WebSocket listen address (server) |
 | `--base-path` | `-p` | `WS_BASE_PATH` | `/wg` | WebSocket base path (server) |
 | `--wg-addr` | `-w` | `WG_SERVER_ADDR` | `127.0.0.1:51820` | Target WireGuard server (server) |
 | `--listen` | `-l` | `WG_LOCAL_ADDR` + `WG_LOCAL_PORT` | `127.0.0.1:51820` | UDP listen address (client) |
@@ -92,11 +87,57 @@ own config beyond the endpoint address.
 | `--local-port` | `-P` | `WG_LOCAL_PORT` | `51820` | UDP port (client) |
 | `--ws-url` | `-u` | `WS_URL` | `ws://localhost:8080/wg` | WebSocket server URL (client) |
 | `--shared-key` | `-k` | `WG_SHARED_KEY` | _(none)_ | Pre-shared key for auth + AES-256-GCM encryption |
+| `--shared-key-file` | `-K` | `WG_SHARED_KEY_FILE` | _(none)_ | Read shared key from file (more secure than CLI) |
+| `--no-auth` | `-n` | `WG_NO_AUTH` | _(none)_ | Explicitly disable authentication (open relay) |
+| `--max-connections` | `-m` | `WG_MAX_CONNECTIONS` | `100` | Max concurrent WebSocket connections (server) |
+| `--allow-origin` | `-o` | `WG_ALLOW_ORIGIN` | _(none)_ | Allowed Origin header value (defense-in-depth) |
 | `--mode` | | `WG_MODE` | `client` | `server` or `client` |
 
 All flags can also be set via environment variables. CLI flags take precedence.
 
-## Running with TLS (production)
+## Security
+
+### Authentication & Encryption
+
+When `--shared-key` (or `-k`) is provided, the tunnel is protected by:
+
+1. **Challenge-response authentication** — the server sends a random nonce,
+   the client responds with `HMAC-SHA256(nonce, key)`. The shared key is
+   **never transmitted** over the wire, and comparison uses
+   `crypto.timingSafeEqual()` to prevent timing side-channel attacks.
+
+2. **AES-256-GCM encryption** — all tunnel data is encrypted with a key derived
+   from the shared secret via **scrypt** (memory-hard KDF), replacing the
+   previous single-round SHA-256. Sequence numbers are included as GCM
+   associated data for replay protection.
+
+3. **Replay protection** — every encrypted message carries a monotonic
+   sequence number authenticated by GCM. Duplicate or out-of-order messages
+   are silently dropped.
+
+4. **Rate limiting** — the server tracks failed authentication attempts per IP.
+   After 5 failed attempts within 60 seconds, the IP is banned for 15 minutes.
+
+5. **Max connections** — configurable limit (default 100) prevents
+   resource-exhaustion attacks.
+
+6. **Origin validation** — optional `--allow-origin` checks the `Origin` header
+   as defense-in-depth against cross-origin WebSocket hijacking.
+
+### Without authentication
+
+If neither `--shared-key` nor `--shared-key-file` is provided, the connection
+is **unauthenticated and unencrypted**. A warning is shown at startup.
+Pass `--no-auth` explicitly to suppress the warning and opt into open-relay mode.
+
+### Key management
+
+- Prefer `--shared-key-file` / `WG_SHARED_KEY_FILE` over CLI flags or
+  environment variables — the key won't appear in `ps aux` or `/proc/self/environ`.
+- Use a strong, randomly generated key (e.g., `openssl rand -base64 32`).
+- Always use `wss://` (TLS) for internet-facing deployments.
+
+### TLS (production)
 
 Use `wss://` in `--ws-url` — Bun's WebSocket client handles TLS natively.
 
@@ -126,8 +167,8 @@ known payload over UDP, and confirms the echo comes back through the tunnel.
 ```
 src/
   index.ts    — Entry point: parses CLI args, dispatches to server or client
-  shared.ts   — Config types, env-var parsing, CLI arg parsing, path normalisation
-  server.ts   — WebSocket server with base-path routing, UDP forwarding
+  shared.ts   — Config types, env-var parsing, CLI arg parsing, crypto, protocol
+  server.ts   — WebSocket server with challenge-response auth, UDP forwarding
   client.ts   — UDP listener, WebSocket forwarding, reconnection
 test/
   integration.sh — End-to-end smoke test
@@ -148,11 +189,8 @@ make all-platforms              # all three at once
 - **Single-peer client:** Tracks one sender address at a time. Works for
   standard single-interface WireGuard setups. For multi-peer or multi-interface
   machines, the client needs a per-source-port socket map.
-- **No authentication:** Any client that reaches the WebSocket endpoint can
-  tunnel UDP through your server. Add a reverse-proxy auth layer or a token
-  handshake for production use.
 - **Plain WebSocket by default:** Switch to `wss://` + TLS for internet-facing
-  deployments (see "Running with TLS" above).
+  deployments.
 - **MTU:** WireGuard default MTU is 1420 bytes. WebSocket binary frames handle
   this comfortably.
 

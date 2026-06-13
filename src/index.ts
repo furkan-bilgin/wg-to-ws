@@ -19,17 +19,21 @@ interface OptionDef {
 }
 
 const CLI_OPTIONS: OptionDef[] = [
-  { name: "help",       type: "boolean", short: "h", desc: "Print this help" },
-  { name: "version",    type: "boolean", short: "v", desc: "Print version" },
-  { name: "bind",       type: "string",  short: "b", desc: "WebSocket listen address",        placeholder: "addr",     default: "0.0.0.0:8080" },
-  { name: "base-path",  type: "string",  short: "p", desc: "WebSocket base path",             placeholder: "path",     default: "/wg" },
-  { name: "wg-addr",    type: "string",  short: "w", desc: "Target WireGuard server",         placeholder: "addr",     default: "127.0.0.1:51820" },
-  { name: "listen",     type: "string",  short: "l", desc: "UDP listen address:port",         placeholder: "addr:port",default: "127.0.0.1:51820" },
-  { name: "local-addr", type: "string",  short: "a", desc: "UDP bind address",                placeholder: "addr",     default: "127.0.0.1" },
-  { name: "local-port", type: "string",  short: "P", desc: "UDP port",                        placeholder: "port",     default: "51820" },
-  { name: "ws-url",     type: "string",  short: "u", desc: "WebSocket server URL",            placeholder: "url",      default: "ws://localhost:8080/wg" },
-  { name: "shared-key", type: "string",  short: "k", desc: "Pre-shared key for auth + encryption", placeholder: "secret" },
-  { name: "mode",       type: "string",               desc: "server or client",               placeholder: "mode",     default: "client" },
+  { name: "help",            type: "boolean", short: "h", desc: "Print this help" },
+  { name: "version",         type: "boolean", short: "v", desc: "Print version" },
+  { name: "bind",            type: "string",  short: "b", desc: "WebSocket listen address",                    placeholder: "addr",     default: "127.0.0.1:8080" },
+  { name: "base-path",       type: "string",  short: "p", desc: "WebSocket base path",                         placeholder: "path",     default: "/wg" },
+  { name: "wg-addr",         type: "string",  short: "w", desc: "Target WireGuard server",                     placeholder: "addr",     default: "127.0.0.1:51820" },
+  { name: "listen",          type: "string",  short: "l", desc: "UDP listen address:port",                     placeholder: "addr:port",default: "127.0.0.1:51820" },
+  { name: "local-addr",      type: "string",  short: "a", desc: "UDP bind address",                            placeholder: "addr",     default: "127.0.0.1" },
+  { name: "local-port",      type: "string",  short: "P", desc: "UDP port",                                    placeholder: "port",     default: "51820" },
+  { name: "ws-url",          type: "string",  short: "u", desc: "WebSocket server URL",                        placeholder: "url",      default: "ws://localhost:8080/wg" },
+  { name: "shared-key",      type: "string",  short: "k", desc: "Pre-shared key for auth + encryption",        placeholder: "secret" },
+  { name: "shared-key-file", type: "string",  short: "K", desc: "Read shared key from file",                   placeholder: "path" },
+  { name: "no-auth",         type: "boolean", short: "n", desc: "Disable authentication (open relay)" },
+  { name: "max-connections", type: "string",  short: "m", desc: "Maximum concurrent WebSocket connections",    placeholder: "num",      default: "100" },
+  { name: "allow-origin",    type: "string",  short: "o", desc: "Allowed Origin header value (defense-in-depth)", placeholder: "origin" },
+  { name: "mode",            type: "string",               desc: "server or client",                           placeholder: "mode",     default: "client" },
 ];
 
 function buildParseOptions(defs: OptionDef[]) {
@@ -63,16 +67,27 @@ function printHelp(defs: OptionDef[]) {
     const withArg = d.type === "string" && d.placeholder
       ? ` <${d.placeholder}>`
       : "";
-    const flagPart = `${flag}${withArg}`.padEnd(40);
+    const flagPart = `${flag}${withArg}`.padEnd(44);
     let descPart = d.desc;
-    if (d.default) descPart += ` (default ${d.default})`;
+    if (d.default) descPart += ` (default: ${d.default})`;
     lines.push(`${flagPart}${descPart}`);
   }
 
   lines.push(
     "",
+    "Environment variables:",
+    "  WG_SHARED_KEY, WG_SHARED_KEY_FILE, WG_NO_AUTH, WG_MAX_CONNECTIONS,",
+    "  WG_ALLOW_ORIGIN, WG_MODE, WS_BIND, WS_BASE_PATH, WG_SERVER_ADDR,",
+    "  WG_LOCAL_ADDR, WG_LOCAL_PORT, WS_URL",
+    "",
+    "Security notes:",
+    "  --shared-key (or -k) enables AES-256-GCM encryption + challenge-response auth.",
+    "  Without it, the connection is unauthenticated and unencrypted.",
+    "  Use --no-auth to suppress the warning and explicitly opt into open-relay mode.",
+    "  Always use wss:// (TLS) for internet-facing deployments.",
+    "",
     "Examples:",
-    "  wg-to-ws server -b 0.0.0.0:443 -p /wg -w 10.0.0.1:51820 -k secret",
+    "  wg-to-ws server -b 127.0.0.1:8080 -p /wg -w 10.0.0.1:51820 -k secret",
     "  wg-to-ws client -l 127.0.0.1:51820 -u wss://example.com/wg -k secret",
   );
 
@@ -82,7 +97,7 @@ function printHelp(defs: OptionDef[]) {
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: buildParseOptions(CLI_OPTIONS),
-  strict: false,
+  strict: true,
   allowPositionals: true,
 });
 
@@ -114,14 +129,18 @@ if (!mode) mode = process.env.WG_MODE || "client";
 // ── Inject CLI values into env (overrides) ────────────────────
 
 const CLI_TO_ENV: Record<string, string> = {
-  bind:       "WS_BIND",
-  "base-path":"WS_BASE_PATH",
-  "wg-addr":  "WG_SERVER_ADDR",
-  "local-addr":"WG_LOCAL_ADDR",
-  "local-port":"WG_LOCAL_PORT",
-  "ws-url":   "WS_URL",
-  "shared-key":"WG_SHARED_KEY",
-  mode:       "WG_MODE",
+  bind:             "WS_BIND",
+  "base-path":      "WS_BASE_PATH",
+  "wg-addr":        "WG_SERVER_ADDR",
+  "local-addr":     "WG_LOCAL_ADDR",
+  "local-port":     "WG_LOCAL_PORT",
+  "ws-url":         "WS_URL",
+  "shared-key":     "WG_SHARED_KEY",
+  "shared-key-file":"WG_SHARED_KEY_FILE",
+  "no-auth":        "WG_NO_AUTH",
+  "max-connections":"WG_MAX_CONNECTIONS",
+  "allow-origin":   "WG_ALLOW_ORIGIN",
+  mode:             "WG_MODE",
 };
 
 for (const [cliKey, envKey] of Object.entries(CLI_TO_ENV)) {
@@ -141,6 +160,21 @@ if (listenVal && typeof listenVal === "string") {
   } else {
     process.env.WG_LOCAL_ADDR = listenVal;
   }
+}
+
+// ── H1: Warn when no auth is configured ───────────────────────
+
+const hasSharedKey =
+  !!process.env.WG_SHARED_KEY || !!process.env.WG_SHARED_KEY_FILE;
+const noAuth = process.env.WG_NO_AUTH === "true" || process.env.WG_NO_AUTH === "1";
+
+if (!hasSharedKey && !noAuth) {
+  console.warn(
+    "WARNING: No shared key configured (--shared-key / WG_SHARED_KEY).\n" +
+    "         The connection will be UNAUTHENTICATED and UNENCRYPTED.\n" +
+    "         Use --shared-key to enable auth + encryption, or pass\n" +
+    "         --no-auth to suppress this warning.",
+  );
 }
 
 // ── Dispatch ──────────────────────────────────────────────────

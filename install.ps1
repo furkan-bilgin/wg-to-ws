@@ -25,6 +25,7 @@ try {
 }
 
 $url = "https://github.com/$repo/releases/download/$tag/$binary"
+$checksumUrl = "https://github.com/$repo/releases/download/$tag/checksums.txt"
 $outFile = "$installDir\wg-to-ws.exe"
 
 # Create install directory
@@ -38,6 +39,29 @@ try {
 } catch {
   Write-Error "Download failed: $_"
   exit 1
+}
+
+# M4: Verify SHA-256 checksum
+Write-Host "Verifying checksum..." -ForegroundColor Cyan
+try {
+  $checksums = Invoke-RestMethod -Uri $checksumUrl -UseBasicParsing
+  $expectedLine = $checksums -split "`n" | Where-Object { $_ -match $binary }
+  if ($expectedLine) {
+    $expectedHash = ($expectedLine -split "\s+")[0]
+    $actualHash = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLower()
+    if ($actualHash -ne $expectedHash.ToLower()) {
+      Write-Error "Checksum mismatch for $binary"
+      Write-Host "  Expected: $expectedHash"
+      Write-Host "  Actual:   $actualHash"
+      Remove-Item $outFile -Force
+      exit 1
+    }
+    Write-Host "Checksum OK" -ForegroundColor Green
+  } else {
+    Write-Warning "$binary not found in checksums.txt — skipping verification"
+  }
+} catch {
+  Write-Warning "Could not fetch checksums.txt — skipping verification: $_"
 }
 
 # Add to PATH for the current user if not already there
