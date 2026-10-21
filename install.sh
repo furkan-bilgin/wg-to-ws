@@ -42,26 +42,34 @@ DEST="${DEST:-/usr/local/bin/wg-to-ws}"
 echo "Downloading $BINARY ($VERSION)..."
 curl -fsSL "$URL" -o /tmp/wg-to-ws
 
-# M4: Verify SHA-256 checksum
+# M4: Verify SHA-256 checksum (FAIL-CLOSED)
 echo "Verifying checksum..."
-CHECKSUMS=$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null || true)
-if [ -n "$CHECKSUMS" ]; then
-  EXPECTED=$(echo "$CHECKSUMS" | grep "$BINARY" | cut -d' ' -f1)
-  if [ -n "$EXPECTED" ]; then
-    ACTUAL=$(sha256sum /tmp/wg-to-ws | cut -d' ' -f1)
-    if [ "$ACTUAL" != "$EXPECTED" ]; then
-      echo "ERROR: Checksum mismatch for $BINARY"
-      echo "  Expected: $EXPECTED"
-      echo "  Actual:   $ACTUAL"
-      rm -f /tmp/wg-to-ws
-      exit 1
-    fi
-    echo "Checksum OK"
-  else
-    echo "WARNING: $BINARY not found in checksums.txt — skipping verification"
-  fi
-else
-  echo "WARNING: Could not fetch checksums.txt — skipping verification"
+if ! CHECKSUMS=$(curl -fsSL "$CHECKSUM_URL"); then
+  echo "ERROR: Could not fetch checksums.txt from $CHECKSUM_URL -- refusing to install"
+  rm -f /tmp/wg-to-ws
+  exit 1
+fi
+EXPECTED=$(echo "$CHECKSUMS" | grep "$BINARY" | cut -d' ' -f1 || true)
+if [ -z "$EXPECTED" ]; then
+  echo "ERROR: $BINARY not found in checksums.txt -- refusing to install"
+  rm -f /tmp/wg-to-ws
+  exit 1
+fi
+ACTUAL=$(sha256sum /tmp/wg-to-ws | cut -d' ' -f1)
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "ERROR: Checksum mismatch for $BINARY"
+  echo "  Expected: $EXPECTED"
+  echo "  Actual:   $ACTUAL"
+  rm -f /tmp/wg-to-ws
+  exit 1
+fi
+echo "Checksum OK"
+# Size sanity check: reject empty/truncated downloads
+SIZE=$(wc -c < /tmp/wg-to-ws | tr -d ' ')
+if [ "$SIZE" -lt 100000 ]; then
+  echo "ERROR: Downloaded binary suspiciously small (${SIZE} bytes) -- refusing to install"
+  rm -f /tmp/wg-to-ws
+  exit 1
 fi
 
 chmod +x /tmp/wg-to-ws

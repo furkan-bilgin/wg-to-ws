@@ -7,7 +7,8 @@ import { parseArgs } from "util";
 
 // Set via `--define VERSION=...` at build time; fallback for dev mode
 declare var WG_VERSION: string | undefined;
-const VERSION: string = WG_VERSION || "dev";
+const VERSION: string =
+  typeof WG_VERSION !== "undefined" ? WG_VERSION : "dev";
 
 interface OptionDef {
   name: string;
@@ -175,6 +176,25 @@ if (!hasSharedKey && !noAuth) {
     "         Use --shared-key to enable auth + encryption, or pass\n" +
     "         --no-auth to suppress this warning.",
   );
+}
+
+// Fail-closed open-relay guard: --no-auth on a non-loopback bind is an
+// unauthenticated UDP proxy. Refuse unless explicitly allowed.
+const bindVal = (process.env.WS_BIND || "127.0.0.1:8080").split(":")[0];
+const isLoopback = bindVal === "127.0.0.1" || bindVal === "::1" || bindVal === "localhost";
+if (noAuth && !isLoopback && process.env.WG_ALLOW_INSECURE_NO_AUTH !== "1") {
+  console.error(
+    "Refusing to run with --no-auth on non-loopback bind. " +
+    "This is an unauthenticated UDP relay. Bind to 127.0.0.1 or set " +
+    "WG_ALLOW_INSECURE_NO_AUTH=1 to override.",
+  );
+  process.exit(1);
+}
+
+// Reject empty/whitespace keys early ( MISCONFIG guard ).
+if (process.env.WG_SHARED_KEY !== undefined && process.env.WG_SHARED_KEY.trim() === "") {
+  console.error("Shared key is empty");
+  process.exit(1);
 }
 
 // ── Dispatch ──────────────────────────────────────────────────

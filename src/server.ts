@@ -6,8 +6,12 @@ import {
   computeAuthHmac,
   encrypt,
   decrypt,
-  encodeSeqNum,
-  decodeSeqNum,
+  encodeHeader,
+  decodeHeader,
+  acceptFrame,
+  shouldRotate,
+  initialRekeyState,
+  normalizeIp,
   makeChallengeMessage,
   parseAuthResponseMessage,
   PING_INTERVAL,
@@ -15,13 +19,19 @@ import {
   MAX_AUTH_ATTEMPTS,
   AUTH_WINDOW_MS,
   BAN_DURATION_MS,
-  SEQ_NUM_BYTES,
+  HEADER_BYTES,
+  MAX_FRAME_BYTES,
+  MAX_PAYLOAD_BYTES,
+  MAX_CONN_PER_IP,
+  CHALLENGE_BYTES,
   type Config,
+  type RekeyState,
 } from "./shared";
 
 const config: Config = loadConfig();
 const basePath = config.wsBasePath;
-const encKey = config.sharedKey ? deriveKey(config.sharedKey) : null;
+const secret = config.sharedKey;
+const getKey = (epoch: number) => deriveKey(secret, epoch);
 
 // ── Rate limiting state ───────────────────────────────────────
 
@@ -34,6 +44,7 @@ interface AuthRecord {
 const authFailures = new Map<string, AuthRecord>();
 
 function checkRateLimit(ip: string): boolean {
+  ip = normalizeIp(ip);
   const now = Date.now();
   const rec = authFailures.get(ip);
 
@@ -52,6 +63,7 @@ function checkRateLimit(ip: string): boolean {
 }
 
 function recordAuthFailure(ip: string): boolean {
+  ip = normalizeIp(ip);
   const now = Date.now();
   let rec = authFailures.get(ip);
 
@@ -62,6 +74,10 @@ function recordAuthFailure(ip: string): boolean {
   }
 
   rec.count++;
+  if (authFailures.size > 10000) {
+    const oldest = authFailures.keys().next().value;
+    if (oldest) authFailures.delete(oldest);
+  }
   if (rec.count >= MAX_AUTH_ATTEMPTS) {
     rec.banUntil = now + BAN_DURATION_MS;
     console.warn(`Rate limit: banned ${ip} for ${BAN_DURATION_MS / 1000}s`);
@@ -92,13 +108,28 @@ interface Session {
   authTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setInterval> | null;
   clientIp: string;
-  // Replay protection: last received sequence number (client→server)
-  lastSeqReceived: number;
-  // Send counter (server→client)
-  sendCounter: number;
+  // Replay/rekey state: receive window (client→server)
+  rx: RekeyState;
+  // Send side (server→client) with per-packet rotation
+  txEpoch: number;
+  txSeq: number;
+  txCount: number;
+  txStartedAt: number;
 }
 
 const sessions = new Map<ServerWebSocket, Session>();
+const connPerIp = new Map<string, number>();
+
+function incConn(ip: string): number {
+  const n = (connPerIp.get(ip) || 0) + 1;
+  connPerIp.set(ip, n);
+  return n;
+}
+function decConn(ip: string): void {
+  const n = (connPerIp.get(ip) || 0) - 1;
+  if (n <= 0) connPerIp.delete(ip);
+  else connPerIp.set(ip, n);
+}
 
 async function createUdpSocket(
   ws: ServerWebSocket,
@@ -114,17 +145,32 @@ async function createUdpSocket(
         data(_socket, buf) {
           const session = sessions.get(ws);
           if (!session || !session.authed) return;
+          // Per-packet rotation: new epoch key every N packets or 1h.
+          if (shouldRotate(session.txCount, Date.now() - session.txStartedAt)) {
+            session.txEpoch++;
+            session.txSeq = 0;
+            session.txCount = 0;
+            session.txStartedAt = Date.now();
+          }
 
           let payload = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
 
-          if (encKey) {
+          if (secret) {
             try {
-              const seqBuf = encodeSeqNum(session.sendCounter);
-              session.sendCounter++;
-              payload = encrypt(payload, encKey, seqBuf);
+              if (payload.length > MAX_PAYLOAD_BYTES) return;
+              const epoch = session.txEpoch;
+              const seq = session.txSeq++;
+              session.txCount++;
+              payload = encrypt(payload, getKey(epoch), epoch, seq);
             } catch {
               return;
             }
+          } else {
+            if (payload.length > MAX_PAYLOAD_BYTES) return;
+            const epoch = session.txEpoch;
+            const seq = session.txSeq++;
+            session.txCount++;
+            payload = Buffer.concat([encodeHeader(epoch, seq), payload]);
           }
 
           if (ws.readyState === 1) ws.sendBinary(payload as Buffer);
@@ -185,8 +231,12 @@ const server = Bun.serve({
       }
     }
 
-    // M2: Cap max connections
-    if (sessions.size >= config.maxConnections) {
+    // M2: Cap max connections (global + per-IP, normalized)
+    const earlyIp = normalizeIp(req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown");
+    if (
+      sessions.size >= config.maxConnections ||
+      (connPerIp.get(earlyIp) || 0) >= Math.min(MAX_CONN_PER_IP, config.maxConnections)
+    ) {
       return new Response("Server at capacity", { status: 503 });
     }
 
@@ -196,9 +246,17 @@ const server = Bun.serve({
   },
   websocket: {
     async open(ws) {
-      // Get client IP
-      const clientIp =
-        ws.remoteAddress || "unknown";
+      // Get client IP (normalized for rate-limit keys)
+      const clientIp = normalizeIp(ws.remoteAddress || "unknown");
+      if (sessions.size >= config.maxConnections) {
+        ws.close(1013, "SERVER:FULL");
+        return;
+      }
+      if ((connPerIp.get(clientIp) || 0) >= Math.min(MAX_CONN_PER_IP, config.maxConnections)) {
+        ws.close(1013, "SERVER:FULL");
+        return;
+      }
+      incConn(clientIp);
 
       // C2: Rate limiting check
       if (!checkRateLimit(clientIp)) {
@@ -210,18 +268,21 @@ const server = Bun.serve({
       const session: Session = {
         udp: null,
         addr: config.wgServerAddr,
-        authed: !encKey,
+        authed: !secret,
         authNonce: null,
         authTimer: null,
         pingTimer: null,
         clientIp,
-        lastSeqReceived: -1,
-        sendCounter: 0,
+        rx: initialRekeyState(),
+        txEpoch: 0,
+        txSeq: 0,
+        txCount: 0,
+        txStartedAt: Date.now(),
       };
 
-      if (encKey) {
+      if (secret) {
         // C1: Send challenge to client
-        session.authNonce = crypto.randomBytes(32);
+        session.authNonce = crypto.randomBytes(CHALLENGE_BYTES);
         ws.sendText(makeChallengeMessage(session.authNonce));
         startAuthTimer(ws, session);
       } else {
@@ -245,30 +306,44 @@ const server = Bun.serve({
       const session = sessions.get(ws);
       if (!session) return;
 
+      // Drop oversize frames early (large-frame DoS guard).
+      const frameLen = typeof raw === "string" ? raw.length : (raw as Buffer).length;
+      if (frameLen > MAX_FRAME_BYTES) {
+        recordAuthFailure(session.clientIp);
+        ws.close(1009, "FRAME:TOO-LARGE");
+        return;
+      }
+
       const data =
         typeof raw === "string" ? Buffer.from(raw) : (raw as Buffer);
 
-      // Handle ping from client — respond with pong
-      if (typeof raw === "string" && raw === "PING") {
-        ws.sendText("PONG");
-        return;
+      // Pre-auth: ignore PING/PONG (no unauthenticated keepalive oracle).
+      if (!session.authed && secret) {
+        if (typeof raw === "string" && (raw === "PING" || raw === "PONG")) return;
+      } else {
+        // Handle ping from client — respond with pong
+        if (typeof raw === "string" && raw === "PING") {
+          ws.sendText("PONG");
+          return;
+        }
+        // Handle pong from client — no-op
+        if (typeof raw === "string" && raw === "PONG") return;
       }
-      // Handle pong from client — no-op
-      if (typeof raw === "string" && raw === "PONG") return;
 
       // C1: Handle auth handshake
-      if (!session.authed && encKey) {
+      if (!session.authed && secret) {
         const msg = typeof raw === "string" ? raw : raw.toString();
 
         // Parse auth response: AUTH:<base64(hmac)>
         const clientHmac = parseAuthResponseMessage(msg);
         if (!clientHmac || !session.authNonce) {
+          recordAuthFailure(session.clientIp);
           ws.close(4001, "AUTH:FAIL");
           return;
         }
 
         // Compute expected HMAC and compare in constant time
-        const expectedHmac = computeAuthHmac(encKey, session.authNonce);
+        const expectedHmac = computeAuthHmac(getKey(0), session.authNonce);
 
         if (
           clientHmac.length === expectedHmac.length &&
@@ -308,21 +383,28 @@ const server = Bun.serve({
 
       let payload = data;
 
-      if (encKey) {
-        // H3: Decrypt and verify sequence number (replay protection)
-        const decrypted = decrypt(data, encKey);
+      if (secret) {
+        // Epoch-keyed decrypt + replay window
+        const header = decodeHeader(data);
+        if (!header) return;
+        const decrypted = decrypt(data, getKey(header.epoch));
         if (!decrypted) return;
-
-        // Extract and verify sequence number
-        const seqBuf = data.subarray(0, SEQ_NUM_BYTES);
-        const seqNum = decodeSeqNum(seqBuf);
-        if (seqNum <= session.lastSeqReceived) {
-          // Replay or out-of-order — drop
-          return;
-        }
-        session.lastSeqReceived = seqNum;
+        const res = acceptFrame(session.rx, header.epoch, header.seq);
+        if (!res.ok) return;
+        session.rx = res.state;
 
         payload = decrypted;
+        if (payload.length > MAX_PAYLOAD_BYTES) return;
+      } else {
+        // No-auth framing: header(8) + plaintext
+        if (data.length < HEADER_BYTES || data.length > MAX_FRAME_BYTES) return;
+        const header = decodeHeader(data);
+        if (!header) return;
+        const res = acceptFrame(session.rx, header.epoch, header.seq);
+        if (!res.ok) return;
+        session.rx = res.state;
+        payload = data.subarray(HEADER_BYTES);
+        if (payload.length > MAX_PAYLOAD_BYTES) return;
       }
 
       session.udp.send(payload);
@@ -333,6 +415,7 @@ const server = Bun.serve({
       if (session) {
         cleanupSession(session);
         sessions.delete(ws);
+        decConn(session.clientIp);
         console.log(`Session closed — ${session.clientIp}`);
       }
     },
@@ -341,7 +424,7 @@ const server = Bun.serve({
 
 console.log(
   `Server listening on ${config.wsBind}, base path "${basePath}"` +
-    (encKey ? ", auth enabled" : ", NO AUTH — open relay"),
+    (secret ? ", auth enabled" : ", NO AUTH — open relay"),
 );
 
 // ── Graceful shutdown ─────────────────────────────────────────

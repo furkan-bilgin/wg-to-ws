@@ -88,8 +88,8 @@ own config beyond the endpoint address.
 | `--ws-url` | `-u` | `WS_URL` | `ws://localhost:8080/wg` | WebSocket server URL (client) |
 | `--shared-key` | `-k` | `WG_SHARED_KEY` | _(none)_ | Pre-shared key for auth + AES-256-GCM encryption |
 | `--shared-key-file` | `-K` | `WG_SHARED_KEY_FILE` | _(none)_ | Read shared key from file (more secure than CLI) |
-| `--no-auth` | `-n` | `WG_NO_AUTH` | _(none)_ | Explicitly disable authentication (open relay) |
-| `--max-connections` | `-m` | `WG_MAX_CONNECTIONS` | `100` | Max concurrent WebSocket connections (server) |
+| `--no-auth` | `-n` | `WG_NO_AUTH` | _(none)_ | Explicitly disable authentication (open relay; refused on non-loopback bind unless `WG_ALLOW_INSECURE_NO_AUTH=1`) |
+| `--max-connections` | `-m` | `WG_MAX_CONNECTIONS` | `100` | Max concurrent WebSocket connections, global (server; clamped 1–10000) |
 | `--allow-origin` | `-o` | `WG_ALLOW_ORIGIN` | _(none)_ | Allowed Origin header value (defense-in-depth) |
 | `--mode` | | `WG_MODE` | `client` | `server` or `client` |
 
@@ -108,18 +108,33 @@ When `--shared-key` (or `-k`) is provided, the tunnel is protected by:
 
 2. **AES-256-GCM encryption** — all tunnel data is encrypted with a key derived
    from the shared secret via **scrypt** (memory-hard KDF), replacing the
-   previous single-round SHA-256. Sequence numbers are included as GCM
-   associated data for replay protection.
+   previous single-round SHA-256. The frame header (epoch + sequence) is GCM
+   associated data, so header tampering fails authentication.
 
-3. **Replay protection** — every encrypted message carries a monotonic
-   sequence number authenticated by GCM. Duplicate or out-of-order messages
-   are silently dropped.
+2a. **Per-packet rekey rotation** — each direction carries an `epoch` key
+   generation plus a per-epoch sequence counter. The sender rotates to a new
+   epoch (fresh `scrypt`-derived key, counter reset) every 500,000 packets or
+   every hour, whichever comes first. The receiver only accepts the current
+   epoch or the next epoch; older epochs and epoch skips are dropped. This
+   bounds how much ciphertext any single key protects.
 
-4. **Rate limiting** — the server tracks failed authentication attempts per IP.
-   After 5 failed attempts within 60 seconds, the IP is banned for 15 minutes.
+3. **Replay protection** — every message carries an `(epoch, sequence)` header
+   authenticated by GCM. Within an epoch the sequence must be strictly
+   monotonic; implausible forward jumps (>1,000,000) are dropped. A new epoch
+   restarts the counter and is only accepted as the immediate next epoch with
+   a small starting sequence. Duplicate, replayed, or cross-epoch stale
+   messages are silently dropped.
 
-5. **Max connections** — configurable limit (default 100) prevents
-   resource-exhaustion attacks.
+4. **Rate limiting** — the server tracks failed authentication attempts per IP
+   (normalized: `::ffff:` stripped, lowercased). After 5 failed attempts
+   within 60 seconds, the IP is banned for 15 minutes. The tracking map is
+   capped at 10,000 entries with oldest-first eviction. Malformed `AUTH` and
+   oversize frames also count as failures.
+
+5. **Max connections** — configurable global limit (default 100, clamped
+   1–10000) plus a per-IP cap (10). Oversize WebSocket frames
+   (`MAX_FRAME_BYTES` = 70,000) are dropped and the sender is
+   rate-limit-counted.
 
 6. **Origin validation** — optional `--allow-origin` checks the `Origin` header
    as defense-in-depth against cross-origin WebSocket hijacking.
@@ -128,12 +143,18 @@ When `--shared-key` (or `-k`) is provided, the tunnel is protected by:
 
 If neither `--shared-key` nor `--shared-key-file` is provided, the connection
 is **unauthenticated and unencrypted**. A warning is shown at startup.
-Pass `--no-auth` explicitly to suppress the warning and opt into open-relay mode.
+Pass `--no-auth` explicitly to suppress the warning. As a fail-closed guard,
+`--no-auth` on a non-loopback bind is **refused** unless
+`WG_ALLOW_INSECURE_NO_AUTH=1` is set — otherwise the server would be an
+unauthenticated UDP relay.
 
 ### Key management
 
 - Prefer `--shared-key-file` / `WG_SHARED_KEY_FILE` over CLI flags or
   environment variables — the key won't appear in `ps aux` or `/proc/self/environ`.
+  Key files over 4 KB are rejected, empty files are rejected, and
+  group/other-readable files trigger a `chmod 600` warning. Empty
+  `--shared-key` values are rejected at startup.
 - Use a strong, randomly generated key (e.g., `openssl rand -base64 32`).
 - Always use `wss://` (TLS) for internet-facing deployments.
 
@@ -156,7 +177,9 @@ location /wg {
 ## Integration test
 
 ```bash
-bash test/integration.sh
+bash test/integration.sh   # end-to-end smoke test (UDP echo through tunnel)
+bun test                   # wire-level replay-window + rekey tests (test/replay.test.ts)
+bunx tsc --noEmit          # typecheck
 ```
 
 Starts a UDP echo server, the wg-to-ws server, the wg-to-ws client, sends a
@@ -172,6 +195,7 @@ src/
   client.ts   — UDP listener, WebSocket forwarding, reconnection
 test/
   integration.sh — End-to-end smoke test
+  replay.test.ts — Wire-level replay-window + epoch rekey tests (`bun test`)
 ```
 
 ## Build
@@ -186,13 +210,18 @@ make all-platforms              # all three at once
 
 ## Caveats
 
-- **Single-peer client:** Tracks one sender address at a time. Works for
-  standard single-interface WireGuard setups. For multi-peer or multi-interface
-  machines, the client needs a per-source-port socket map.
+- **Single-peer client:** Pins the first UDP sender (address:port) and routes
+  replies only to that peer; spoofed sources are ignored. The pin refreshes
+  after 60 s idle or on reconnect, so a legit peer change recovers. The
+  sender map is bounded (`MAX_SENDERS` = 8) and the pre-auth buffer is capped
+  (`MAX_PENDING_QUEUE` = 100).
 - **Plain WebSocket by default:** Switch to `wss://` + TLS for internet-facing
-  deployments.
+  deployments. `wss://` is required (not optional) for Internet use.
 - **MTU:** WireGuard default MTU is 1420 bytes. WebSocket binary frames handle
-  this comfortably.
+  this comfortably. UDP payloads over 65507 bytes are dropped.
+- **Install verification:** `install.sh` / `install.ps1` verify SHA-256
+  checksums fail-closed (abort on mismatch, missing file, or fetch failure).
+  CI pins third-party actions by SHA and publishes build provenance.
 
 ## License
 

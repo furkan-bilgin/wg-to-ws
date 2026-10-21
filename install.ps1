@@ -41,27 +41,37 @@ try {
   exit 1
 }
 
-# M4: Verify SHA-256 checksum
+# M4: Verify SHA-256 checksum (FAIL-CLOSED)
 Write-Host "Verifying checksum..." -ForegroundColor Cyan
 try {
   $checksums = Invoke-RestMethod -Uri $checksumUrl -UseBasicParsing
-  $expectedLine = $checksums -split "`n" | Where-Object { $_ -match $binary }
-  if ($expectedLine) {
-    $expectedHash = ($expectedLine -split "\s+")[0]
-    $actualHash = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLower()
-    if ($actualHash -ne $expectedHash.ToLower()) {
-      Write-Error "Checksum mismatch for $binary"
-      Write-Host "  Expected: $expectedHash"
-      Write-Host "  Actual:   $actualHash"
-      Remove-Item $outFile -Force
-      exit 1
-    }
-    Write-Host "Checksum OK" -ForegroundColor Green
-  } else {
-    Write-Warning "$binary not found in checksums.txt — skipping verification"
-  }
 } catch {
-  Write-Warning "Could not fetch checksums.txt — skipping verification: $_"
+  Write-Error "Could not fetch checksums.txt from $checksumUrl — refusing to install: $_"
+  Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+  exit 1
+}
+$expectedLine = $checksums -split "`n" | Where-Object { $_ -match $binary }
+if (-not $expectedLine) {
+  Write-Error "$binary not found in checksums.txt — refusing to install"
+  Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+  exit 1
+}
+$expectedHash = ($expectedLine -split "\s+")[0]
+$actualHash = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLower()
+if ($actualHash -ne $expectedHash.ToLower()) {
+  Write-Error "Checksum mismatch for $binary"
+  Write-Host "  Expected: $expectedHash"
+  Write-Host "  Actual:   $actualHash"
+  Remove-Item $outFile -Force
+  exit 1
+}
+Write-Host "Checksum OK" -ForegroundColor Green
+# Size sanity check: reject empty/truncated downloads
+$fileSize = (Get-Item $outFile).Length
+if ($fileSize -lt 100000) {
+  Write-Error "Downloaded binary suspiciously small (${fileSize} bytes) — refusing to install"
+  Remove-Item $outFile -Force
+  exit 1
 }
 
 # Add to PATH for the current user if not already there

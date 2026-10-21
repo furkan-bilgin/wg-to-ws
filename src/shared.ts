@@ -32,7 +32,22 @@ export const AUTH_WINDOW_MS = 60_000;
 export const BAN_DURATION_MS = 15 * 60_000;
 
 /** Max entries in the client sender map. */
-export const MAX_SENDERS = 100;
+export const MAX_SENDERS = 8;
+
+/** Max buffered UDP packets before WS auth completes. */
+export const MAX_PENDING_QUEUE = 100;
+/** Max UDP payload (65507) — larger datagrams are dropped. */
+export const MAX_PAYLOAD_BYTES = 65507;
+/** Max WS frame: seq(4)+nonce(12)+payload+tag(16) with headroom. */
+export const MAX_FRAME_BYTES = 70_000;
+/** Challenge nonce length. */
+export const CHALLENGE_BYTES = 32;
+/** Force reconnect before 32-bit seq wraps (replay safety). */
+export const REKEY_AFTER_PACKETS = 500_000;
+/** Rotate epoch at least this often (ms), even on idle sessions. */
+export const REKEY_AFTER_MS = 3_600_000;
+/** Per-IP connection cap (also bounded by global max-connections). */
+export const MAX_CONN_PER_IP = 10;
 
 /** Max concurrent sessions (default, overridable via --max-connections). */
 export const DEFAULT_MAX_CONNECTIONS = 100;
@@ -40,14 +55,29 @@ export const DEFAULT_MAX_CONNECTIONS = 100;
 /** Salt used for key derivation (domain-separated, not secret). */
 const KDF_SALT = "wg-to-ws-v1";
 
+/** Epoch key cache (bounded, per process). */
+const epochKeyCache = new Map<string, Buffer>();
+
 /**
  * Derive a 32-byte AES-256-GCM key from a shared secret using scrypt.
  *
  * scrypt is deliberately slow and memory-hard, making offline brute-force
- * infeasible compared to the previous single-round SHA-256.
+ * infeasible compared to the previous single-round SHA-256. Each epoch
+ * gets its own key via domain separation, so rotation bounds how much
+ * ciphertext any single key protects.
  */
-export function deriveKey(secret: string): Buffer {
-  return crypto.scryptSync(secret, KDF_SALT, 32, { N: 16384, r: 8, p: 1 });
+export function deriveKey(secret: string, epoch = 0): Buffer {
+  const cacheKey = `${epoch}:${secret.length}:${secret.slice(0, 8)}`;
+  const hit = epochKeyCache.get(cacheKey);
+  if (hit) return hit;
+  const key = crypto.scryptSync(secret, `${KDF_SALT}|e${epoch}`, 32, {
+    N: 16384,
+    r: 8,
+    p: 1,
+  });
+  if (epochKeyCache.size > 8) epochKeyCache.clear();
+  epochKeyCache.set(cacheKey, key);
+  return key;
 }
 
 /**
@@ -62,6 +92,24 @@ export function computeAuthHmac(derivedKey: Buffer, challenge: Buffer): Buffer {
 
 /** Size of the sequence number prefix in bytes (4 = uint32). */
 export const SEQ_NUM_BYTES = 4;
+/** Epoch field length (uint32 BE) prepended to every frame. */
+export const EPOCH_BYTES = 4;
+/** Wire header: epoch(4) + seq(4). */
+export const HEADER_BYTES = EPOCH_BYTES + SEQ_NUM_BYTES;
+
+/** Encode epoch+seq header (8 bytes big-endian). */
+export function encodeHeader(epoch: number, seq: number): Buffer {
+  const buf = Buffer.alloc(HEADER_BYTES);
+  buf.writeUInt32BE(epoch >>> 0, 0);
+  buf.writeUInt32BE(seq >>> 0, EPOCH_BYTES);
+  return buf;
+}
+
+/** Decode epoch+seq header. Returns null on short buffers. */
+export function decodeHeader(buf: Buffer): { epoch: number; seq: number } | null {
+  if (buf.length < HEADER_BYTES) return null;
+  return { epoch: buf.readUInt32BE(0), seq: buf.readUInt32BE(EPOCH_BYTES) };
+}
 
 /**
  * Encode a uint32 sequence number into a 4-byte big-endian buffer.
@@ -81,29 +129,129 @@ export function decodeSeqNum(buf: Buffer): number {
   return buf.readUInt32BE(0);
 }
 
+/** Max uint32 seq value. */
+export const MAX_SEQ = 0xffffffff;
+
+/** Validate next seq against last accepted (strict monotonic + wrap guard). */
+export function isValidSeq(last: number, seq: number): boolean {
+  if (seq <= last) return false;
+  // Reject implausible forward jumps (spoofed AAD). WS is ordered TCP,
+  // so legitimate gaps stay small.
+  if (seq - last > 1_000_000) return false;
+  return true;
+}
+
+/** Receiver replay state per direction (one epoch active at a time). */
+export interface RekeyState {
+  epoch: number;
+  lastSeq: number;
+}
+
+export function initialRekeyState(): RekeyState {
+  return { epoch: 0, lastSeq: -1 };
+}
+
+/**
+ * Validate an incoming (epoch, seq) against receiver state.
+ * WS transport is ordered, so the sender never has old-epoch frames in
+ * flight after rotation: only current epoch (monotonic seq) or the next
+ * epoch (fresh counter) is accepted. Anything else is dropped.
+ */
+export function acceptFrame(
+  state: RekeyState,
+  epoch: number,
+  seq: number,
+): { ok: boolean; state: RekeyState } {
+  if (epoch < state.epoch || epoch > state.epoch + 1) return { ok: false, state };
+  if (epoch === state.epoch + 1) {
+    // Fresh epoch restarts the counter; allow only a small starting seq.
+    if (seq > 1000) return { ok: false, state };
+    return { ok: true, state: { epoch, lastSeq: seq } };
+  }
+  if (!isValidSeq(state.lastSeq, seq)) return { ok: false, state };
+  return { ok: true, state: { epoch, lastSeq: seq } };
+}
+
+/** Sender rotation check: packet count or wall-clock age. */
+export function shouldRotate(packetsSinceRotate: number, msSinceRotate: number): boolean {
+  return packetsSinceRotate >= REKEY_AFTER_PACKETS || msSinceRotate >= REKEY_AFTER_MS;
+}
+
+/** Normalize client IP for rate-limit keys (strip ::ffff:, brackets, case). */
+export function normalizeIp(ip: string): string {
+  let s = ip.trim().toLowerCase();
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  if (s.startsWith("::ffff:")) s = s.slice(7);
+  return s;
+}
+
+/** Validate upstream host (IP or DNS name), no spaces/control chars. */
+export function isValidHost(host: string): boolean {
+  if (!host || host.length > 253) return false;
+  if (/[\s\0<>"'`\\]/.test(host)) return false;
+  return /^[A-Za-z0-9._-]+$/.test(host);
+}
+
+/** True if bind address is loopback-only. */
+export function isLoopbackBind(bind: string): boolean {
+  const host = bind.split(":")[0];
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+/** Sender-pin state for single-peer client reply routing. */
+export interface SenderPinState {
+  pinned: string | null;
+  pinnedAt: number;
+}
+
+export function initialSenderPin(): SenderPinState {
+  return { pinned: null, pinnedAt: 0 };
+}
+
+/**
+ * Decide whether a UDP datagram source is accepted for reply routing.
+ * First sender wins; spoofed sources are ignored. Re-pins after TTL or
+ * when the pinned entry was evicted, so a legit peer change recovers.
+ */
+export function updateSenderPin(
+  state: SenderPinState,
+  hasPinnedEntry: boolean,
+  key: string,
+  now: number,
+  ttlMs: number,
+): { state: SenderPinState; accepted: boolean } {
+  let s = state;
+  if (!s.pinned || !hasPinnedEntry || now - s.pinnedAt > ttlMs) {
+    s = { pinned: key, pinnedAt: now };
+  }
+  return { state: s, accepted: key === s.pinned };
+}
+
 // ── Encryption / Decryption (AES-256-GCM + AAD) ──────────────
 
 /**
  * Encrypt a buffer with AES-256-GCM.
  *
- * Format: [seq_num (4 bytes)][nonce (12 bytes)][ciphertext (N bytes)][auth_tag (16 bytes)]
+ * Format: [epoch (4)][seq (4)][nonce (12)][ciphertext (N)][auth_tag (16)]
  *
- * The sequence number is included as AAD so GCM's integrity check
+ * The epoch+sequence header is included as AAD so GCM's integrity check
  * prevents replay or reordering of ciphertexts.
  */
 export function encrypt(
   plaintext: Buffer,
   key: Buffer,
-  seqNumBuf: Buffer,
+  epoch: number,
+  seqNum: number,
 ): Buffer {
+  const header = encodeHeader(epoch, seqNum);
   const nonce = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce, {
     authTagLength: 16,
   });
-  cipher.setAAD(seqNumBuf);
+  cipher.setAAD(header);
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return Buffer.concat([seqNumBuf, nonce, encrypted, tag]);
+  return Buffer.concat([header, nonce, encrypted, tag]);
 }
 
 /**
@@ -111,15 +259,17 @@ export function encrypt(
  * Returns the plaintext buffer, or null on authentication failure.
  */
 export function decrypt(data: Buffer, key: Buffer): Buffer | null {
-  const seqNumBuf = data.subarray(0, SEQ_NUM_BYTES);
-  const nonce = data.subarray(SEQ_NUM_BYTES, SEQ_NUM_BYTES + 12);
+  const minLen = HEADER_BYTES + 12 + 16;
+  if (data.length < minLen || data.length > MAX_FRAME_BYTES) return null;
+  const header = data.subarray(0, HEADER_BYTES);
+  const nonce = data.subarray(HEADER_BYTES, HEADER_BYTES + 12);
   const tag = data.subarray(data.length - 16);
-  const ciphertext = data.subarray(SEQ_NUM_BYTES + 12, data.length - 16);
+  const ciphertext = data.subarray(HEADER_BYTES + 12, data.length - 16);
   try {
     const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce, {
       authTagLength: 16,
     });
-    decipher.setAAD(seqNumBuf);
+    decipher.setAAD(header);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   } catch {
@@ -142,9 +292,13 @@ export function makeChallengeMessage(nonce: Buffer): string {
 /** Client parses CHALLENGE:<base64(nonce)> from server. */
 export function parseChallengeMessage(msg: string): Buffer | null {
   if (!msg.startsWith(CHALLENGE_TAG)) return null;
+  if (msg.length > 128) return null;
   const b64 = msg.slice(CHALLENGE_TAG.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(b64)) return null;
   try {
-    return Buffer.from(b64, "base64url");
+    const buf = Buffer.from(b64, "base64url");
+    if (buf.length !== CHALLENGE_BYTES) return null;
+    return buf;
   } catch {
     return null;
   }
@@ -158,9 +312,13 @@ export function makeAuthResponseMessage(hmac: Buffer): string {
 /** Server parses AUTH:<base64(hmac)> from client. */
 export function parseAuthResponseMessage(msg: string): Buffer | null {
   if (!msg.startsWith(AUTH_TAG)) return null;
+  if (msg.length > 128) return null;
   const b64 = msg.slice(AUTH_TAG.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(b64)) return null;
   try {
-    return Buffer.from(b64, "base64url");
+    const buf = Buffer.from(b64, "base64url");
+    if (buf.length !== 32) return null;
+    return buf;
   } catch {
     return null;
   }
@@ -229,7 +387,7 @@ export function parseCLIArgs(argv: string[]): Record<string, string> {
     } else {
       const shortKey = arg.slice(1);
       const longKey = CLI_ALIASES[shortKey];
-      if (!longKey) continue;
+      if (!longKey) throw new Error(`Unknown option -${shortKey}`);
 
       if (shortKey === "l") {
         val = argv[++i];
@@ -250,7 +408,8 @@ export function parseCLIArgs(argv: string[]): Record<string, string> {
     }
 
     const envName = FLAG_TO_ENV[key];
-    if (envName) overrides[envName] = val;
+    if (!envName) throw new Error(`Unknown option --${key}`);
+    overrides[envName] = val;
   }
 
   return overrides;
@@ -298,20 +457,47 @@ export function loadConfig(cliArgs?: string[]): Config {
   let sharedKey = env.WG_SHARED_KEY || "";
   if (!sharedKey && env.WG_SHARED_KEY_FILE) {
     try {
-      sharedKey = require("fs")
-        .readFileSync(env.WG_SHARED_KEY_FILE, "utf-8")
-        .trim();
+      const fs = require("fs") as typeof import("fs");
+      const st = fs.statSync(env.WG_SHARED_KEY_FILE);
+      if (st.size > 4096) {
+        console.error("Shared key file too large (max 4KB)");
+        process.exit(1);
+      }
+      // Warn on world/group-readable key files (POSIX).
+      if (typeof st.mode === "number" && st.mode & 0o077) {
+        console.warn(
+          `Warning: shared key file "${env.WG_SHARED_KEY_FILE}" is readable by group/other — chmod 600 recommended`,
+        );
+      }
+      sharedKey = fs.readFileSync(env.WG_SHARED_KEY_FILE, "utf-8").trim();
+      if (!sharedKey) {
+        console.error("Shared key file is empty");
+        process.exit(1);
+      }
     } catch (err) {
       console.error(
-        `Failed to read shared key file "${env.WG_SHARED_KEY_FILE}": ${err}`,
+        `Failed to read shared key file: ${(err as Error).message}`,
       );
       process.exit(1);
     }
   }
 
   const noAuth = env.WG_NO_AUTH === "true" || env.WG_NO_AUTH === "1";
-  const maxConnections = parseInt(env.WG_MAX_CONNECTIONS || "", 10) || DEFAULT_MAX_CONNECTIONS;
+  let maxConnections = parseInt(env.WG_MAX_CONNECTIONS || "", 10) || DEFAULT_MAX_CONNECTIONS;
+  if (!Number.isFinite(maxConnections)) maxConnections = DEFAULT_MAX_CONNECTIONS;
+  maxConnections = Math.min(10000, Math.max(1, maxConnections));
   const allowOrigin = env.WG_ALLOW_ORIGIN || "";
+
+  // Validate upstream + bind formats (SSRF / misconfig guard).
+  const wgHost = (env.WG_SERVER_ADDR || "127.0.0.1:51820").split(":")[0];
+  if (!isValidHost(wgHost)) {
+    console.error("Invalid WG_SERVER_ADDR host");
+    process.exit(1);
+  }
+  if (localPort <= 0 || localPort > 65535) {
+    console.error("Invalid local port");
+    process.exit(1);
+  }
 
   return {
     mode,
@@ -330,5 +516,8 @@ export function loadConfig(cliArgs?: string[]): Config {
 
 /** Normalise a path: strip trailing slashes and collapse double slashes. */
 export function normalizePath(p: string): string {
-  return "/" + p.replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+  if (p.includes("\0") || p.includes("..")) return "/wg";
+  const clean = "/" + p.replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+  if (clean.length > 256) return "/wg";
+  return clean;
 }

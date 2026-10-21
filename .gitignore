@@ -1,5 +1,7 @@
 # Built binaries
+/wg-to-ws
 wg-to-ws
+wg-to-ws-*-*
 wg-to-ws-darwin-arm64
 wg-to-ws-linux-x64
 wg-to-ws-windows-x64.exe
