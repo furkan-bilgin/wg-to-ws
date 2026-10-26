@@ -183,8 +183,11 @@ function connectWs() {
     }
   };
 
-  ws.onclose = () => {
-    console.log("WebSocket disconnected — reconnecting...");
+  ws.onclose = (event: CloseEvent) => {
+    const detail = event.reason ? `code ${event.code}: ${event.reason}` : `code ${event.code}`;
+    const line = `WebSocket disconnected (${detail}) — reconnecting...`;
+    if (event.code === 1000 || event.code === 1001) console.log(line);
+    else console.error(line);
     stopPing();
     if (authTimer) clearTimeout(authTimer);
     authTimer = null;
@@ -196,7 +199,9 @@ function connectWs() {
     setTimeout(connectWs, delay);
   };
 
-  ws.onerror = () => {
+  ws.onerror = (event: Event) => {
+    const msg = (event as ErrorEvent).message;
+    if (msg) console.error(`WebSocket error: ${msg}`);
     ws?.close();
   };
 }
