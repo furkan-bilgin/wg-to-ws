@@ -33,6 +33,7 @@ const CLI_OPTIONS: OptionDef[] = [
   { name: "shared-key-file", type: "string",  short: "K", desc: "Read shared key from file",                   placeholder: "path" },
   { name: "no-auth",         type: "boolean", short: "n", desc: "Disable authentication (open relay)" },
   { name: "max-connections", type: "string",  short: "m", desc: "Maximum concurrent WebSocket connections",    placeholder: "num",      default: "100" },
+  { name: "trust-proxy",     type: "boolean",             desc: "Trust X-Forwarded-For from a reverse proxy" },
   { name: "allow-origin",    type: "string",  short: "o", desc: "Allowed Origin header value (defense-in-depth)", placeholder: "origin" },
   { name: "mode",            type: "string",               desc: "server or client",                           placeholder: "mode",     default: "client" },
 ];
@@ -78,8 +79,8 @@ function printHelp(defs: OptionDef[]) {
     "",
     "Environment variables:",
     "  WG_SHARED_KEY, WG_SHARED_KEY_FILE, WG_NO_AUTH, WG_MAX_CONNECTIONS,",
-    "  WG_ALLOW_ORIGIN, WG_MODE, WS_BIND, WS_BASE_PATH, WG_SERVER_ADDR,",
-    "  WG_LOCAL_ADDR, WG_LOCAL_PORT, WS_URL",
+    "  WG_TRUST_PROXY, WG_ALLOW_ORIGIN, WG_MODE, WS_BIND, WS_BASE_PATH,",
+    "  WG_SERVER_ADDR, WG_LOCAL_ADDR, WG_LOCAL_PORT, WS_URL",
     "",
     "Security notes:",
     "  --shared-key (or -k) enables AES-256-GCM encryption + challenge-response auth.",
@@ -140,6 +141,7 @@ const CLI_TO_ENV: Record<string, string> = {
   "shared-key-file":"WG_SHARED_KEY_FILE",
   "no-auth":        "WG_NO_AUTH",
   "max-connections":"WG_MAX_CONNECTIONS",
+  "trust-proxy":    "WG_TRUST_PROXY",
   "allow-origin":   "WG_ALLOW_ORIGIN",
   mode:             "WG_MODE",
 };

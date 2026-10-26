@@ -90,6 +90,7 @@ own config beyond the endpoint address.
 | `--shared-key-file` | `-K` | `WG_SHARED_KEY_FILE` | _(none)_ | Read shared key from file (more secure than CLI) |
 | `--no-auth` | `-n` | `WG_NO_AUTH` | _(none)_ | Explicitly disable authentication (open relay; refused on non-loopback bind unless `WG_ALLOW_INSECURE_NO_AUTH=1`) |
 | `--max-connections` | `-m` | `WG_MAX_CONNECTIONS` | `100` | Max concurrent WebSocket connections, global (server; clamped 1–10000) |
+| `--trust-proxy` | | `WG_TRUST_PROXY` | `false` | Take the client IP from the last `X-Forwarded-For` hop (server behind a reverse proxy) |
 | `--allow-origin` | `-o` | `WG_ALLOW_ORIGIN` | _(none)_ | Allowed Origin header value (defense-in-depth) |
 | `--mode` | | `WG_MODE` | `client` | `server` or `client` |
 
@@ -134,7 +135,8 @@ When `--shared-key` (or `-k`) is provided, the tunnel is protected by:
 5. **Max connections** — configurable global limit (default 100, clamped
    1–10000) plus a per-IP cap (10). Oversize WebSocket frames
    (`MAX_FRAME_BYTES` = 70,000) are dropped and the sender is
-   rate-limit-counted.
+   rate-limit-counted. Behind a reverse proxy, set `--trust-proxy` so the
+   per-IP cap and auth bans use the real client IP, not the proxy's.
 
 6. **Origin validation** — optional `--allow-origin` checks the `Origin` header
    as defense-in-depth against cross-origin WebSocket hijacking.
@@ -171,8 +173,16 @@ location /wg {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
+    # Overwrite, so clients cannot pre-seed the header
+    proxy_set_header X-Forwarded-For $remote_addr;
 }
 ```
+
+Then start the server with `--trust-proxy`. Without it, every connection
+enters the per-IP limit and the auth ban under `127.0.0.1` (the proxy), so
+10 concurrent peers lock out the server. Only enable it when the server is
+not directly reachable; otherwise clients can spoof the header and bypass
+per-IP limits and bans.
 
 ## Integration test
 

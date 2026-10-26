@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { isIP } from "node:net";
 
 export type Mode = "client" | "server";
 
@@ -13,6 +14,7 @@ export interface Config {
   sharedKey: string;
   noAuth: boolean;
   maxConnections: number;
+  trustProxy: boolean;
   allowOrigin: string;
 }
 
@@ -185,6 +187,19 @@ export function normalizeIp(ip: string): string {
   return s;
 }
 
+/**
+ * Client IP from the last X-Forwarded-For hop: the value the trusted proxy
+ * appended. Earlier hops are client-supplied and must not be trusted.
+ * Returns null when the header is absent or malformed.
+ */
+export function forwardedClientIp(xff: string | null): string | null {
+  if (!xff || xff.length > 1024) return null;
+  const last = xff.split(",").pop()?.trim();
+  if (!last) return null;
+  const ip = normalizeIp(last);
+  return isIP(ip) ? ip : null;
+}
+
 /** Validate upstream host (IP or DNS name), no spaces/control chars. */
 export function isValidHost(host: string): boolean {
   if (!host || host.length > 253) return false;
@@ -343,6 +358,7 @@ const FLAG_TO_ENV: Record<string, string> = {
   "shared-key-file": "WG_SHARED_KEY_FILE",
   "no-auth": "WG_NO_AUTH",
   "max-connections": "WG_MAX_CONNECTIONS",
+  "trust-proxy": "WG_TRUST_PROXY",
   "allow-origin": "WG_ALLOW_ORIGIN",
 };
 
@@ -430,6 +446,7 @@ export function loadConfig(cliArgs?: string[]): Config {
     WG_SHARED_KEY_FILE: process.env.WG_SHARED_KEY_FILE,
     WG_NO_AUTH: process.env.WG_NO_AUTH,
     WG_MAX_CONNECTIONS: process.env.WG_MAX_CONNECTIONS,
+    WG_TRUST_PROXY: process.env.WG_TRUST_PROXY,
     WG_ALLOW_ORIGIN: process.env.WG_ALLOW_ORIGIN,
   };
 
@@ -486,6 +503,7 @@ export function loadConfig(cliArgs?: string[]): Config {
   let maxConnections = parseInt(env.WG_MAX_CONNECTIONS || "", 10) || DEFAULT_MAX_CONNECTIONS;
   if (!Number.isFinite(maxConnections)) maxConnections = DEFAULT_MAX_CONNECTIONS;
   maxConnections = Math.min(10000, Math.max(1, maxConnections));
+  const trustProxy = env.WG_TRUST_PROXY === "true" || env.WG_TRUST_PROXY === "1";
   const allowOrigin = env.WG_ALLOW_ORIGIN || "";
 
   // Validate upstream + bind formats (SSRF / misconfig guard).
@@ -510,6 +528,7 @@ export function loadConfig(cliArgs?: string[]): Config {
     sharedKey,
     noAuth,
     maxConnections,
+    trustProxy,
     allowOrigin,
   };
 }

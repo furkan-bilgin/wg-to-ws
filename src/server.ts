@@ -12,6 +12,7 @@ import {
   shouldRotate,
   initialRekeyState,
   normalizeIp,
+  forwardedClientIp,
   makeChallengeMessage,
   parseAuthResponseMessage,
   PING_INTERVAL,
@@ -27,6 +28,12 @@ import {
   type Config,
   type RekeyState,
 } from "./shared";
+
+interface WsData {
+  clientIp: string;
+}
+
+type ServerWS = ServerWebSocket<WsData>;
 
 const config: Config = loadConfig();
 const basePath = config.wsBasePath;
@@ -117,7 +124,7 @@ interface Session {
   txStartedAt: number;
 }
 
-const sessions = new Map<ServerWebSocket, Session>();
+const sessions = new Map<ServerWS, Session>();
 const connPerIp = new Map<string, number>();
 
 function incConn(ip: string): number {
@@ -132,7 +139,7 @@ function decConn(ip: string): void {
 }
 
 async function createUdpSocket(
-  ws: ServerWebSocket,
+  ws: ServerWS,
   remoteAddr: string,
 ): Promise<import("bun").udp.ConnectedSocket<"buffer"> | null> {
   const [host, portStr] = remoteAddr.split(":");
@@ -187,7 +194,7 @@ async function createUdpSocket(
   }
 }
 
-function startPing(ws: ServerWebSocket) {
+function startPing(ws: ServerWS) {
   return setInterval(() => {
     if (ws.readyState === 1) ws.sendText("PING");
   }, PING_INTERVAL);
@@ -195,7 +202,7 @@ function startPing(ws: ServerWebSocket) {
 
 // ── Auth challenge timer ──────────────────────────────────────
 
-function startAuthTimer(ws: ServerWebSocket, session: Session) {
+function startAuthTimer(ws: ServerWS, session: Session) {
   session.authTimer = setTimeout(() => {
     if (!session.authed) {
       console.warn(
@@ -214,7 +221,7 @@ function cleanupSession(session: Session) {
 
 // ── HTTP / WebSocket server ───────────────────────────────────
 
-const server = Bun.serve({
+const server = Bun.serve<WsData>({
   port: parseInt(config.wsBind.split(":")[1] || "8080", 10),
   hostname: config.wsBind.split(":")[0] || "127.0.0.1",
   fetch(req, server) {
@@ -232,22 +239,25 @@ const server = Bun.serve({
     }
 
     // M2: Cap max connections (global + per-IP, normalized)
-    const earlyIp = normalizeIp(req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown");
+    const peerIp = normalizeIp(server.requestIP(req)?.address || "unknown");
+    const clientIp = config.trustProxy
+      ? forwardedClientIp(req.headers.get("x-forwarded-for")) ?? peerIp
+      : peerIp;
     if (
       sessions.size >= config.maxConnections ||
-      (connPerIp.get(earlyIp) || 0) >= Math.min(MAX_CONN_PER_IP, config.maxConnections)
+      (connPerIp.get(clientIp) || 0) >= Math.min(MAX_CONN_PER_IP, config.maxConnections)
     ) {
       return new Response("Server at capacity", { status: 503 });
     }
 
-    const success = server.upgrade(req);
+    const success = server.upgrade(req, { data: { clientIp } });
     if (success) return undefined;
     return new Response("Upgrade failed", { status: 400 });
   },
   websocket: {
     async open(ws) {
-      // Get client IP (normalized for rate-limit keys)
-      const clientIp = normalizeIp(ws.remoteAddress || "unknown");
+      // Resolved in fetch: peer address, or X-Forwarded-For when --trust-proxy is set
+      const clientIp = ws.data.clientIp;
       if (sessions.size >= config.maxConnections) {
         ws.close(1013, "SERVER:FULL");
         return;
@@ -256,9 +266,7 @@ const server = Bun.serve({
         ws.close(1013, "SERVER:FULL");
         return;
       }
-      incConn(clientIp);
-
-      // C2: Rate limiting check
+      // C2: Rate limiting check (before accounting so rejects never leak the counter)
       if (!checkRateLimit(clientIp)) {
         ws.close(4001, "AUTH:BANNED");
         return;
@@ -280,6 +288,10 @@ const server = Bun.serve({
         txStartedAt: Date.now(),
       };
 
+      // Register before any await: every close path must release the slot.
+      sessions.set(ws, session);
+      incConn(clientIp);
+
       if (secret) {
         // C1: Send challenge to client
         session.authNonce = crypto.randomBytes(CHALLENGE_BYTES);
@@ -298,8 +310,6 @@ const server = Bun.serve({
           `New session — ${clientIp} connected (no auth), UDP → ${config.wgServerAddr}`,
         );
       }
-
-      sessions.set(ws, session);
     },
 
     message(ws, raw) {
@@ -407,6 +417,7 @@ const server = Bun.serve({
         if (payload.length > MAX_PAYLOAD_BYTES) return;
       }
 
+      if (!session.udp) return;
       session.udp.send(payload);
     },
 
