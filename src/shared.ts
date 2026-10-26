@@ -13,6 +13,7 @@ export interface Config {
   wsBasePath: string;
   sharedKey: string;
   noAuth: boolean;
+  noBan: boolean;
   maxConnections: number;
   trustProxy: boolean;
   allowOrigin: string;
@@ -357,6 +358,7 @@ const FLAG_TO_ENV: Record<string, string> = {
   "shared-key": "WG_SHARED_KEY",
   "shared-key-file": "WG_SHARED_KEY_FILE",
   "no-auth": "WG_NO_AUTH",
+  "no-ban": "WG_NO_BAN",
   "max-connections": "WG_MAX_CONNECTIONS",
   "trust-proxy": "WG_TRUST_PROXY",
   "allow-origin": "WG_ALLOW_ORIGIN",
@@ -445,6 +447,7 @@ export function loadConfig(cliArgs?: string[]): Config {
     WG_SHARED_KEY: process.env.WG_SHARED_KEY,
     WG_SHARED_KEY_FILE: process.env.WG_SHARED_KEY_FILE,
     WG_NO_AUTH: process.env.WG_NO_AUTH,
+    WG_NO_BAN: process.env.WG_NO_BAN,
     WG_MAX_CONNECTIONS: process.env.WG_MAX_CONNECTIONS,
     WG_TRUST_PROXY: process.env.WG_TRUST_PROXY,
     WG_ALLOW_ORIGIN: process.env.WG_ALLOW_ORIGIN,
@@ -500,6 +503,7 @@ export function loadConfig(cliArgs?: string[]): Config {
   }
 
   const noAuth = env.WG_NO_AUTH === "true" || env.WG_NO_AUTH === "1";
+  const noBan = env.WG_NO_BAN === "true" || env.WG_NO_BAN === "1";
   let maxConnections = parseInt(env.WG_MAX_CONNECTIONS || "", 10) || DEFAULT_MAX_CONNECTIONS;
   if (!Number.isFinite(maxConnections)) maxConnections = DEFAULT_MAX_CONNECTIONS;
   maxConnections = Math.min(10000, Math.max(1, maxConnections));
@@ -527,6 +531,7 @@ export function loadConfig(cliArgs?: string[]): Config {
     wsBasePath: normalizePath(env.WS_BASE_PATH || "/wg"),
     sharedKey,
     noAuth,
+    noBan,
     maxConnections,
     trustProxy,
     allowOrigin,

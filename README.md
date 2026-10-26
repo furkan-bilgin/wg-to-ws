@@ -89,6 +89,7 @@ own config beyond the endpoint address.
 | `--shared-key` | `-k` | `WG_SHARED_KEY` | _(none)_ | Pre-shared key for auth + AES-256-GCM encryption |
 | `--shared-key-file` | `-K` | `WG_SHARED_KEY_FILE` | _(none)_ | Read shared key from file (more secure than CLI) |
 | `--no-auth` | `-n` | `WG_NO_AUTH` | _(none)_ | Explicitly disable authentication (open relay; refused on non-loopback bind unless `WG_ALLOW_INSECURE_NO_AUTH=1`) |
+| `--no-ban` | | `WG_NO_BAN` | `false` | Disable auth-failure bans (must be set on the server) |
 | `--max-connections` | `-m` | `WG_MAX_CONNECTIONS` | `100` | Max concurrent WebSocket connections, global (server; clamped 1–10000) |
 | `--trust-proxy` | | `WG_TRUST_PROXY` | `false` | Take the client IP from the last `X-Forwarded-For` hop (server behind a reverse proxy) |
 | `--allow-origin` | `-o` | `WG_ALLOW_ORIGIN` | _(none)_ | Allowed Origin header value (defense-in-depth) |
@@ -130,7 +131,8 @@ When `--shared-key` (or `-k`) is provided, the tunnel is protected by:
    (normalized: `::ffff:` stripped, lowercased). After 5 failed attempts
    within 60 seconds, the IP is banned for 15 minutes. The tracking map is
    capped at 10,000 entries with oldest-first eviction. Malformed `AUTH` and
-   oversize frames also count as failures.
+   oversize frames also count as failures. `--no-ban` disables the ban
+   (restart the server to clear active bans).
 
 5. **Max connections** — configurable global limit (default 100, clamped
    1–10000) plus a per-IP cap (10). Oversize WebSocket frames

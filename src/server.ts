@@ -51,6 +51,7 @@ interface AuthRecord {
 const authFailures = new Map<string, AuthRecord>();
 
 function checkRateLimit(ip: string): boolean {
+  if (config.noBan) return true;
   ip = normalizeIp(ip);
   const now = Date.now();
   const rec = authFailures.get(ip);
@@ -70,6 +71,7 @@ function checkRateLimit(ip: string): boolean {
 }
 
 function recordAuthFailure(ip: string): boolean {
+  if (config.noBan) return true;
   ip = normalizeIp(ip);
   const now = Date.now();
   let rec = authFailures.get(ip);
@@ -435,7 +437,8 @@ const server = Bun.serve<WsData>({
 
 console.log(
   `Server listening on ${config.wsBind}, base path "${basePath}"` +
-    (secret ? ", auth enabled" : ", NO AUTH — open relay"),
+    (secret ? ", auth enabled" : ", NO AUTH — open relay") +
+    (config.noBan ? ", bans disabled" : ""),
 );
 
 // ── Graceful shutdown ─────────────────────────────────────────
